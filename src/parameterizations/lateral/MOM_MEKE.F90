@@ -5,21 +5,24 @@ module MOM_MEKE
 
 ! This file is part of MOM6. See LICENSE.md for the license.
 
-use MOM_debugging,     only : hchksum, uvchksum
-use MOM_cpu_clock,     only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, CLOCK_ROUTINE
-use MOM_diag_mediator, only : post_data, register_diag_field, safe_alloc_ptr
-use MOM_diag_mediator, only : diag_ctrl, time_type
-use MOM_domains,       only : create_group_pass, do_group_pass, group_pass_type
-use MOM_error_handler, only : MOM_error, FATAL, WARNING, NOTE, MOM_mesg
-use MOM_file_parser,   only : read_param, get_param, log_version, param_file_type
-use MOM_grid,          only : ocean_grid_type
-use MOM_hor_index,     only : hor_index_type
-use MOM_io,            only : vardesc, var_desc, slasher
-use MOM_restart,       only : MOM_restart_CS, register_restart_field, query_initialized
-use MOM_unit_scaling,  only : unit_scale_type
-use MOM_variables,     only : vertvisc_type
-use MOM_verticalGrid,  only : verticalGrid_type
-use MOM_MEKE_types,    only : MEKE_type
+use MOM_debugging,        only : hchksum, uvchksum
+use MOM_coms,             only : PE_here
+use MOM_cpu_clock,        only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, CLOCK_ROUTINE
+use MOM_diag_mediator,    only : post_data, register_diag_field, safe_alloc_ptr
+use MOM_diag_mediator,    only : diag_ctrl, time_type
+use MOM_domains,          only : create_group_pass, do_group_pass, group_pass_type
+use MOM_error_handler,    only : MOM_error, FATAL, WARNING, NOTE, MOM_mesg
+use MOM_file_parser,      only : read_param, get_param, log_version, param_file_type
+use MOM_grid,             only : ocean_grid_type
+use MOM_hor_index,        only : hor_index_type
+use MOM_io,               only : vardesc, var_desc, slasher
+use silc_client,          only : client_type
+use MOM_string_functions, only : lowercase
+use MOM_restart,          only : MOM_restart_CS, register_restart_field, query_initialized
+use MOM_unit_scaling,     only : unit_scale_type
+use MOM_variables,        only : vertvisc_type
+use MOM_verticalGrid,     only : verticalGrid_type
+use MOM_MEKE_types,       only : MEKE_type
 
 use time_interp_external_mod, only : init_external_field, time_interp_external
 use time_interp_external_mod, only : time_interp_external_init
@@ -29,6 +32,15 @@ implicit none ; private
 #include <MOM_memory.h>
 
 public step_forward_MEKE, MEKE_init, MEKE_alloc_register_restart, MEKE_end
+
+!> Private enum to define the source of the EKE used in MEKE
+enum, bind(c)
+
+  enumerator :: EKE_PROG
+  enumerator :: EKE_FILE
+  enumerator :: EKE_SILC
+
+end enum
 
 !> Control structure that contains MEKE parameters and diagnostics handles
 type, public :: MEKE_CS ; private
@@ -48,7 +60,6 @@ type, public :: MEKE_CS ; private
   logical :: visc_drag  !< If true use the vertvisc_type to calculate bottom drag.
   logical :: MEKE_GEOMETRIC !< If true, uses the GM coefficient formulation from the GEOMETRIC
                         !! framework (Marshall et al., 2012)
-  logical :: MEKE_from_file !< If true, reads EKE from a netCDF file
   real    :: MEKE_GEOMETRIC_alpha !< The nondimensional coefficient governing the efficiency of the
                         !! GEOMETRIC thickness diffusion.
   logical :: MEKE_equilibrium_alt !< If true, use an alternative calculation for the
@@ -93,7 +104,30 @@ type, public :: MEKE_CS ; private
   character(len=200)  :: inputdir !< directory where NetCDF input files are
   character(len=200)       :: eke_file !< filename for eke data
   character(len=30)        :: eke_var_name !< name of variable in ncfile
+  integer :: eke_src !< Integer specifying whether EKE is stepped forward prognostically (default, 0),
+                     !! read in from a file (1), or inferred using the SILC client (2)
+  ! Inferring EKE from ML
+  type(client_type) :: silc
+  logical :: use_mke     !< If true, use mean kinetic energy when predicting EKE
+  logical :: use_slope_z !< If true, use vertically averaged slope when predicting EKE
+  logical :: use_rv_z    !< If true, use relative vorticity when predicting EKE
+  logical :: use_div_sfc !< If true, use surface divergence when predicting EKE
+  logical :: use_def_sfc !< If true, use surface deformation when predicting EKE
+  logical :: use_rd_dx_z !< If true, use Rossby radius divided by grid spacing when predicting EKE
+  character(len=24) :: script_name !< Name of the script for preprocessing
+  character(len=24) :: model_name !< Name of the model to load
+  real, dimension(:,:), allocatable :: mke
+  real, dimension(:,:), allocatable :: slope_z
+  real, dimension(:,:), allocatable :: rv_z
+  real, dimension(:,:), allocatable :: div_sfc
+  real, dimension(:,:), allocatable :: def_sfc
+  real, dimension(:,:), allocatable :: rd_dx_z
+  integer :: n_predictands !< How many predictands when inferring from an ML-aglorithm
+  character(len=7) :: key_suffix !< Suffix appended to every key sent to Redis
   type(diag_ctrl), pointer :: diag => NULL() !< A type that regulates diagnostics output
+  character(len=24), dimension(:), allocatable :: inputs  !< Key names associated with the inputs to the script/model
+  character(len=24), dimension(:), allocatable :: outputs !< Outputs from the script
+  character(len=24), dimension(1) :: EKE_key
   !>@{ Diagnostic handles
   integer :: id_MEKE = -1, id_Ue = -1, id_Kh = -1, id_src = -1
   integer :: id_Ub = -1, id_Ut = -1
@@ -130,7 +164,7 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
   type(time_type),                          intent(in)    :: Time !< The time used for interpolating EKE
 
   ! Local variables
-  real, dimension(SZI_(G),SZJ_(G)) :: &
+  real(kind=8), dimension(SZI_(G),SZJ_(G)) :: &
     data_eke, &     ! EKE from file
     mass, &         ! The total mass of the water column [R Z ~> kg m-2].
     I_mass, &       ! The inverse of mass [R-1 Z-1 ~> m2 kg-1].
@@ -174,6 +208,7 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
   real :: sdt_damp  ! dt for damping [T ~> s] (sdt could be split).
   logical :: use_drag_rate ! Flag to indicate drag_rate is finite
   integer :: i, j, k, is, ie, js, je, Isq, Ieq, Jsq, Jeq, nz
+  integer :: input_idx
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec ; nz = G%ke
   Isq = G%IscB ; Ieq = G%IecB ; Jsq = G%JscB ; Jeq = G%JecB
@@ -196,364 +231,421 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
     return
   endif
 
-  if (.not. CS%MEKE_from_file) then
+  select case (CS%eke_src)
+    case(EKE_PROG)
+      if (CS%debug) then
+        if (associated(MEKE%mom_src)) &
+          call hchksum(MEKE%mom_src, 'MEKE mom_src', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
+        if (associated(MEKE%GME_snk)) &
+          call hchksum(MEKE%GME_snk, 'MEKE GME_snk', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
+        if (associated(MEKE%GM_src)) &
+          call hchksum(MEKE%GM_src, 'MEKE GM_src', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
+        if (associated(MEKE%MEKE)) call hchksum(MEKE%MEKE, 'MEKE MEKE', G%HI, scale=US%L_T_to_m_s**2)
+        call uvchksum("MEKE SN_[uv]", SN_u, SN_v, G%HI, scale=US%s_to_T, &
+                      scalar_pair=.true.)
+        call uvchksum("MEKE h[uv]", hu, hv, G%HI, haloshift=1, &
+                      scale=GV%H_to_m*(US%L_to_m**2))
+      endif
 
-    if (CS%debug) then
-      if (associated(MEKE%mom_src)) &
-        call hchksum(MEKE%mom_src, 'MEKE mom_src', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
-      if (associated(MEKE%GME_snk)) &
-        call hchksum(MEKE%GME_snk, 'MEKE GME_snk', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
-      if (associated(MEKE%GM_src)) &
-        call hchksum(MEKE%GM_src, 'MEKE GM_src', G%HI, scale=US%RZ3_T3_to_W_m2*US%L_to_Z**2)
-      if (associated(MEKE%MEKE)) call hchksum(MEKE%MEKE, 'MEKE MEKE', G%HI, scale=US%L_T_to_m_s**2)
-      call uvchksum("MEKE SN_[uv]", SN_u, SN_v, G%HI, scale=US%s_to_T, &
-                    scalar_pair=.true.)
-      call uvchksum("MEKE h[uv]", hu, hv, G%HI, haloshift=1, &
-                    scale=GV%H_to_m*(US%L_to_m**2))
-    endif
+      sdt = dt*CS%MEKE_dtScale ! Scaled dt to use for time-stepping
+      Rho0 = GV%Rho0
+      mass_neglect = GV%H_to_RZ * GV%H_subroundoff
+      cdrag2 = CS%cdrag**2
 
-    sdt = dt*CS%MEKE_dtScale ! Scaled dt to use for time-stepping
-    Rho0 = GV%Rho0
-    mass_neglect = GV%H_to_RZ * GV%H_subroundoff
-    cdrag2 = CS%cdrag**2
+      ! With a depth-dependent (and possibly strong) damping, it seems
+      ! advisable to use Strang splitting between the damping and diffusion.
+      sdt_damp = sdt ; if (CS%MEKE_KH >= 0.0 .or. CS%MEKE_K4 >= 0.) sdt_damp = 0.5*sdt
 
-    ! With a depth-dependent (and possibly strong) damping, it seems
-    ! advisable to use Strang splitting between the damping and diffusion.
-    sdt_damp = sdt ; if (CS%MEKE_KH >= 0.0 .or. CS%MEKE_K4 >= 0.) sdt_damp = 0.5*sdt
-
-    ! Calculate depth integrated mass exchange if doing advection [R Z L2 ~> kg]
-    if (CS%MEKE_advection_factor>0.) then
-      do j=js,je ; do I=is-1,ie
-        baroHu(I,j) = 0.
-      enddo ; enddo
-      do k=1,nz
+      ! Calculate depth integrated mass exchange if doing advection [R Z L2 ~> kg]
+      if (CS%MEKE_advection_factor>0.) then
         do j=js,je ; do I=is-1,ie
-          baroHu(I,j) = hu(I,j,k) * GV%H_to_RZ
+          baroHu(I,j) = 0.
         enddo ; enddo
-      enddo
-      do J=js-1,je ; do i=is,ie
-        baroHv(i,J) = 0.
-      enddo ; enddo
-      do k=1,nz
+        do k=1,nz
+          do j=js,je ; do I=is-1,ie
+            baroHu(I,j) = hu(I,j,k) * GV%H_to_RZ
+          enddo ; enddo
+        enddo
         do J=js-1,je ; do i=is,ie
-          baroHv(i,J) = hv(i,J,k) * GV%H_to_RZ
+          baroHv(i,J) = 0.
         enddo ; enddo
-      enddo
-    endif
+        do k=1,nz
+          do J=js-1,je ; do i=is,ie
+            baroHv(i,J) = hv(i,J,k) * GV%H_to_RZ
+          enddo ; enddo
+        enddo
+      endif
 
-    if (CS%MEKE_Cd_scale == 0.0 .and. .not. CS%visc_drag) then
-      !$OMP parallel do default(shared) private(ldamping)
-      do j=js,je ; do i=is,ie
-        drag_rate(i,j) = 0. ; drag_rate_J15(i,j) = 0.
-      enddo ; enddo
-    endif
+      if (CS%MEKE_Cd_scale == 0.0 .and. .not. CS%visc_drag) then
+        !$OMP parallel do default(shared) private(ldamping)
+        do j=js,je ; do i=is,ie
+          drag_rate(i,j) = 0. ; drag_rate_J15(i,j) = 0.
+        enddo ; enddo
+      endif
 
-    ! Calculate drag_rate_visc(i,j) which accounts for the model bottom mean flow
-    if (CS%visc_drag) then
-      !$OMP parallel do default(shared)
-      do j=js,je ; do I=is-1,ie
-        drag_vel_u(I,j) = 0.0
-        if ((G%mask2dCu(I,j) > 0.0) .and. (visc%bbl_thick_u(I,j) > 0.0)) &
-          drag_vel_u(I,j) = visc%Kv_bbl_u(I,j) / visc%bbl_thick_u(I,j)
-      enddo ; enddo
-      !$OMP parallel do default(shared)
-      do J=js-1,je ; do i=is,ie
-        drag_vel_v(i,J) = 0.0
-        if ((G%mask2dCv(i,J) > 0.0) .and. (visc%bbl_thick_v(i,J) > 0.0)) &
-          drag_vel_v(i,J) = visc%Kv_bbl_v(i,J) / visc%bbl_thick_v(i,J)
-      enddo ; enddo
+      ! Calculate drag_rate_visc(i,j) which accounts for the model bottom mean flow
+      if (CS%visc_drag) then
+        !$OMP parallel do default(shared)
+        do j=js,je ; do I=is-1,ie
+          drag_vel_u(I,j) = 0.0
+          if ((G%mask2dCu(I,j) > 0.0) .and. (visc%bbl_thick_u(I,j) > 0.0)) &
+            drag_vel_u(I,j) = visc%Kv_bbl_u(I,j) / visc%bbl_thick_u(I,j)
+        enddo ; enddo
+        !$OMP parallel do default(shared)
+        do J=js-1,je ; do i=is,ie
+          drag_vel_v(i,J) = 0.0
+          if ((G%mask2dCv(i,J) > 0.0) .and. (visc%bbl_thick_v(i,J) > 0.0)) &
+            drag_vel_v(i,J) = visc%Kv_bbl_v(i,J) / visc%bbl_thick_v(i,J)
+        enddo ; enddo
 
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        drag_rate_visc(i,j) = (0.25*G%IareaT(i,j) * US%Z_to_L * &
-                ((G%areaCu(I-1,j)*drag_vel_u(I-1,j) + &
-                  G%areaCu(I,j)*drag_vel_u(I,j)) + &
-                 (G%areaCv(i,J-1)*drag_vel_v(i,J-1) + &
-                  G%areaCv(i,J)*drag_vel_v(i,J)) ) )
-      enddo ; enddo
-    else
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        drag_rate_visc(i,j) = 0.
-      enddo ; enddo
-    endif
-
-    !$OMP parallel do default(shared)
-    do j=js-1,je+1
-      do i=is-1,ie+1 ; mass(i,j) = 0.0 ; enddo
-      do k=1,nz ; do i=is-1,ie+1
-        mass(i,j) = mass(i,j) + G%mask2dT(i,j) * (GV%H_to_RZ * h(i,j,k)) ! [R Z ~> kg m-2]
-      enddo ; enddo
-      do i=is-1,ie+1
-        I_mass(i,j) = 0.0
-        if (mass(i,j) > 0.0) I_mass(i,j) = 1.0 / mass(i,j) ! [R-1 Z-1 ~> m2 kg-1]
-      enddo
-    enddo
-
-    if (CS%initialize) then
-      call MEKE_equilibrium(CS, MEKE, G, GV, US, SN_u, SN_v, drag_rate_visc, I_mass)
-      CS%initialize = .false.
-    endif
-
-    ! Calculates bottomFac2, barotrFac2 and LmixScale
-    call MEKE_lengthScales(CS, MEKE, G, GV, US, SN_u, SN_v, MEKE%MEKE, bottomFac2, barotrFac2, LmixScale)
-    if (CS%debug) then
-      if (CS%visc_drag) &
-        call uvchksum("MEKE drag_vel_[uv]", drag_vel_u, drag_vel_v, G%HI, &
-                      scale=US%Z_to_m*US%s_to_T, scalar_pair=.true.)
-      call hchksum(mass, 'MEKE mass',G%HI,haloshift=1, scale=US%RZ_to_kg_m2)
-      call hchksum(drag_rate_visc, 'MEKE drag_rate_visc', G%HI, scale=US%L_T_to_m_s)
-      call hchksum(bottomFac2, 'MEKE bottomFac2', G%HI)
-      call hchksum(barotrFac2, 'MEKE barotrFac2', G%HI)
-      call hchksum(LmixScale, 'MEKE LmixScale', G%HI,scale=US%L_to_m)
-    endif
-
-    ! Aggregate sources of MEKE (background, frictional and GM)
-    !$OMP parallel do default(shared)
-    do j=js,je ; do i=is,ie
-      src(i,j) = CS%MEKE_BGsrc
-    enddo ; enddo
-
-    if (associated(MEKE%mom_src)) then
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        src(i,j) = src(i,j) - CS%MEKE_FrCoeff*I_mass(i,j)*MEKE%mom_src(i,j)
-      enddo ; enddo
-    endif
-
-    if (associated(MEKE%GME_snk)) then
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        src(i,j) = src(i,j) - CS%MEKE_GMECoeff*I_mass(i,j)*MEKE%GME_snk(i,j)
-      enddo ; enddo
-    endif
-
-    if (associated(MEKE%GM_src)) then
-      if (CS%GM_src_alt) then
         !$OMP parallel do default(shared)
         do j=js,je ; do i=is,ie
-          src(i,j) = src(i,j) - CS%MEKE_GMcoeff*MEKE%GM_src(i,j) / &
-                     (GV%Rho0 * MAX(1.0*US%m_to_Z, G%bathyT(i,j)))
+          drag_rate_visc(i,j) = (0.25*G%IareaT(i,j) * US%Z_to_L * &
+                  ((G%areaCu(I-1,j)*drag_vel_u(I-1,j) + &
+                    G%areaCu(I,j)*drag_vel_u(I,j)) + &
+                   (G%areaCv(i,J-1)*drag_vel_v(i,J-1) + &
+                    G%areaCv(i,J)*drag_vel_v(i,J)) ) )
         enddo ; enddo
       else
         !$OMP parallel do default(shared)
         do j=js,je ; do i=is,ie
-          src(i,j) = src(i,j) - CS%MEKE_GMcoeff*I_mass(i,j)*MEKE%GM_src(i,j)
-        enddo ; enddo
-      endif
-    endif
-
-    if (CS%MEKE_equilibrium_restoring) then
-      call MEKE_equilibrium_restoring(CS, G, US, SN_u, SN_v)
-      do j=js,je ; do i=is,ie
-        src(i,j) = src(i,j) - CS%MEKE_restoring_rate*(MEKE%MEKE(i,j) - CS%equilibrium_value(i,j))
-      enddo ; enddo
-    endif
-
-    ! Increase EKE by a full time-steps worth of source
-    !$OMP parallel do default(shared)
-    do j=js,je ; do i=is,ie
-      MEKE%MEKE(i,j) = (MEKE%MEKE(i,j) + sdt*src(i,j))*G%mask2dT(i,j)
-    enddo ; enddo
-
-    if (use_drag_rate) then
-      ! Calculate a viscous drag rate (includes BBL contributions from mean flow and eddies)
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        drag_rate(i,j) = (US%L_to_Z*Rho0 * I_mass(i,j)) * sqrt( drag_rate_visc(i,j)**2 + &
-                 cdrag2 * ( max(0.0, 2.0*bottomFac2(i,j)*MEKE%MEKE(i,j)) + CS%MEKE_Uscale**2 ) )
-      enddo ; enddo
-    endif
-
-    ! First stage of Strang splitting
-    !$OMP parallel do default(shared)
-    do j=js,je ; do i=is,ie
-      ldamping = CS%MEKE_damping + drag_rate(i,j) * bottomFac2(i,j)
-      if (MEKE%MEKE(i,j) < 0.) ldamping = 0.
-      ! notice that the above line ensures a damping only if MEKE is positive,
-      ! while leaving MEKE unchanged if it is negative
-      MEKE%MEKE(i,j) =  MEKE%MEKE(i,j) / (1.0 + sdt_damp*ldamping)
-      MEKE_decay(i,j) = ldamping*G%mask2dT(i,j)
-    enddo ; enddo
-
-    if (CS%kh_flux_enabled .or. CS%MEKE_K4 >= 0.0) then
-      ! Update MEKE in the halos for lateral or bi-harmonic diffusion
-      call cpu_clock_begin(CS%id_clock_pass)
-      call do_group_pass(CS%pass_MEKE, G%Domain)
-      call cpu_clock_end(CS%id_clock_pass)
-    endif
-
-    if (CS%MEKE_K4 >= 0.0) then
-      ! Calculate Laplacian of MEKE using MEKE_uflux and MEKE_vflux as temporary work space.
-      !$OMP parallel do default(shared)
-      do j=js-1,je+1 ; do I=is-2,ie+1
-        ! MEKE_uflux is used here as workspace with units of [L2 T-2 ~> m2 s-2].
-        MEKE_uflux(I,j) = ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * G%mask2dCu(I,j)) * &
-            (MEKE%MEKE(i+1,j) - MEKE%MEKE(i,j))
-      ! This would have units of [R Z L2 T-2 ~> kg s-2]
-      ! MEKE_uflux(I,j) = ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
-      !     ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
-      !     (MEKE%MEKE(i+1,j) - MEKE%MEKE(i,j))
-      enddo ; enddo
-      !$OMP parallel do default(shared)
-      do J=js-2,je+1 ; do i=is-1,ie+1
-        ! MEKE_vflux is used here as workspace with units of [L2 T-2 ~> m2 s-2].
-        MEKE_vflux(i,J) = ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * G%mask2dCv(i,J)) * &
-            (MEKE%MEKE(i,j+1) - MEKE%MEKE(i,j))
-      ! This would have units of [R Z L2 T-2 ~> kg s-2]
-      ! MEKE_vflux(i,J) = ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * &
-      !     ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
-      !     (MEKE%MEKE(i,j+1) - MEKE%MEKE(i,j))
-      enddo ; enddo
-
-      !$OMP parallel do default(shared)
-      do j=js-1,je+1 ; do i=is-1,ie+1 ! del2MEKE has units [T-2 ~> s-2].
-        del2MEKE(i,j) = G%IareaT(i,j) * &
-            ((MEKE_uflux(I,j) - MEKE_uflux(I-1,j)) + (MEKE_vflux(i,J) - MEKE_vflux(i,J-1)))
-      enddo ; enddo
-
-      ! Bi-harmonic diffusion of MEKE
-      !$OMP parallel do default(shared) private(K4_here,Inv_K4_max)
-      do j=js,je ; do I=is-1,ie
-        K4_here = CS%MEKE_K4 ! [L4 T-1 ~> m4 s-1]
-        ! Limit Kh to avoid CFL violations.
-        Inv_K4_max = 64.0 * sdt * ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
-                     max(G%IareaT(i,j), G%IareaT(i+1,j)))**2
-        if (K4_here*Inv_K4_max > 0.3) K4_here = 0.3 / Inv_K4_max
-
-        ! Here the units of MEKE_uflux are [R Z L4 T-3 ~> kg m2 s-3].
-        MEKE_uflux(I,j) = ((K4_here * (G%dy_Cu(I,j)*G%IdxCu(I,j))) * &
-            ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
-            (del2MEKE(i+1,j) - del2MEKE(i,j))
-      enddo ; enddo
-      !$OMP parallel do default(shared) private(K4_here,Inv_K4_max)
-      do J=js-1,je ; do i=is,ie
-        K4_here = CS%MEKE_K4 ! [L4 T-1 ~> m4 s-1]
-        Inv_K4_max = 64.0 * sdt * ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * max(G%IareaT(i,j), G%IareaT(i,j+1)))**2
-        if (K4_here*Inv_K4_max > 0.3) K4_here = 0.3 / Inv_K4_max
-
-        ! Here the units of MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
-        MEKE_vflux(i,J) = ((K4_here * (G%dx_Cv(i,J)*G%IdyCv(i,J))) * &
-            ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
-            (del2MEKE(i,j+1) - del2MEKE(i,j))
-      enddo ; enddo
-      ! Store change in MEKE arising from the bi-harmonic in del4MEKE [L2 T-2 ~> m2 s-2].
-      !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        del4MEKE(i,j) = (sdt*(G%IareaT(i,j)*I_mass(i,j))) * &
-            ((MEKE_uflux(I-1,j) - MEKE_uflux(I,j)) + &
-             (MEKE_vflux(i,J-1) - MEKE_vflux(i,J)))
-      enddo ; enddo
-    endif !
-
-    if (CS%kh_flux_enabled) then
-      ! Lateral diffusion of MEKE
-      Kh_here = max(0., CS%MEKE_Kh)
-      !$OMP parallel do default(shared) firstprivate(Kh_here) private(Inv_Kh_max)
-      do j=js,je ; do I=is-1,ie
-        ! Limit Kh to avoid CFL violations.
-        if (associated(MEKE%Kh)) &
-          Kh_here = max(0., CS%MEKE_Kh) + &
-              CS%KhMEKE_Fac*0.5*(MEKE%Kh(i,j)+MEKE%Kh(i+1,j))
-        if (associated(MEKE%Kh_diff)) &
-          Kh_here = max(0.,CS%MEKE_Kh) + &
-              CS%KhMEKE_Fac*0.5*(MEKE%Kh_diff(i,j)+MEKE%Kh_diff(i+1,j))
-        Inv_Kh_max = 2.0*sdt * ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
-                     max(G%IareaT(i,j),G%IareaT(i+1,j)))
-        if (Kh_here*Inv_Kh_max > 0.25) Kh_here = 0.25 / Inv_Kh_max
-        Kh_u(I,j) = Kh_here
-
-        ! Here the units of MEKE_uflux and MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
-        MEKE_uflux(I,j) = ((Kh_here * (G%dy_Cu(I,j)*G%IdxCu(I,j))) * &
-            ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
-            (MEKE%MEKE(i,j) - MEKE%MEKE(i+1,j))
-      enddo ; enddo
-      !$OMP parallel do default(shared) firstprivate(Kh_here) private(Inv_Kh_max)
-      do J=js-1,je ; do i=is,ie
-        if (associated(MEKE%Kh)) &
-          Kh_here = max(0.,CS%MEKE_Kh) + CS%KhMEKE_Fac * 0.5*(MEKE%Kh(i,j)+MEKE%Kh(i,j+1))
-        if (associated(MEKE%Kh_diff)) &
-          Kh_here = max(0.,CS%MEKE_Kh) + CS%KhMEKE_Fac * 0.5*(MEKE%Kh_diff(i,j)+MEKE%Kh_diff(i,j+1))
-        Inv_Kh_max = 2.0*sdt * ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * max(G%IareaT(i,j),G%IareaT(i,j+1)))
-        if (Kh_here*Inv_Kh_max > 0.25) Kh_here = 0.25 / Inv_Kh_max
-        Kh_v(i,J) = Kh_here
-
-        ! Here the units of MEKE_uflux and MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
-        MEKE_vflux(i,J) = ((Kh_here * (G%dx_Cv(i,J)*G%IdyCv(i,J))) * &
-            ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
-            (MEKE%MEKE(i,j) - MEKE%MEKE(i,j+1))
-      enddo ; enddo
-      if (CS%MEKE_advection_factor>0.) then
-        advFac = CS%MEKE_advection_factor / sdt ! [T-1 ~> s-1]
-        !$OMP parallel do default(shared)
-        do j=js,je ; do I=is-1,ie
-          ! Here the units of the quantities added to MEKE_uflux are [R Z L4 T-3 ~> kg m2 s-3].
-          if (baroHu(I,j)>0.) then
-            MEKE_uflux(I,j) = MEKE_uflux(I,j) + baroHu(I,j)*MEKE%MEKE(i,j)*advFac
-          elseif (baroHu(I,j)<0.) then
-            MEKE_uflux(I,j) = MEKE_uflux(I,j) + baroHu(I,j)*MEKE%MEKE(i+1,j)*advFac
-          endif
-        enddo ; enddo
-        !$OMP parallel do default(shared)
-        do J=js-1,je ; do i=is,ie
-          ! Here the units of the quantities added to MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
-          if (baroHv(i,J)>0.) then
-            MEKE_vflux(i,J) = MEKE_vflux(i,J) + baroHv(i,J)*MEKE%MEKE(i,j)*advFac
-          elseif (baroHv(i,J)<0.) then
-            MEKE_vflux(i,J) = MEKE_vflux(i,J) + baroHv(i,J)*MEKE%MEKE(i,j+1)*advFac
-          endif
+          drag_rate_visc(i,j) = 0.
         enddo ; enddo
       endif
 
       !$OMP parallel do default(shared)
-      do j=js,je ; do i=is,ie
-        MEKE%MEKE(i,j) = MEKE%MEKE(i,j) + (sdt*(G%IareaT(i,j)*I_mass(i,j))) * &
-            ((MEKE_uflux(I-1,j) - MEKE_uflux(I,j)) + &
-             (MEKE_vflux(i,J-1) - MEKE_vflux(i,J)))
-      enddo ; enddo
-    endif ! MEKE_KH>0
+      do j=js-1,je+1
+        do i=is-1,ie+1 ; mass(i,j) = 0.0 ; enddo
+        do k=1,nz ; do i=is-1,ie+1
+          mass(i,j) = mass(i,j) + G%mask2dT(i,j) * (GV%H_to_RZ * h(i,j,k)) ! [R Z ~> kg m-2]
+        enddo ; enddo
+        do i=is-1,ie+1
+          I_mass(i,j) = 0.0
+          if (mass(i,j) > 0.0) I_mass(i,j) = 1.0 / mass(i,j) ! [R-1 Z-1 ~> m2 kg-1]
+        enddo
+      enddo
 
-    ! Add on bi-harmonic tendency
-    if (CS%MEKE_K4 >= 0.0) then
+      if (CS%initialize) then
+        call MEKE_equilibrium(CS, MEKE, G, GV, US, SN_u, SN_v, drag_rate_visc, I_mass)
+        CS%initialize = .false.
+      endif
+
+      ! Calculates bottomFac2, barotrFac2 and LmixScale
+      call MEKE_lengthScales(CS, MEKE, G, GV, US, SN_u, SN_v, MEKE%MEKE, bottomFac2, barotrFac2, LmixScale)
+      if (CS%debug) then
+        if (CS%visc_drag) &
+          call uvchksum("MEKE drag_vel_[uv]", drag_vel_u, drag_vel_v, G%HI, &
+                        scale=US%Z_to_m*US%s_to_T, scalar_pair=.true.)
+        call hchksum(mass, 'MEKE mass',G%HI,haloshift=1, scale=US%RZ_to_kg_m2)
+        call hchksum(drag_rate_visc, 'MEKE drag_rate_visc', G%HI, scale=US%L_T_to_m_s)
+        call hchksum(bottomFac2, 'MEKE bottomFac2', G%HI)
+        call hchksum(barotrFac2, 'MEKE barotrFac2', G%HI)
+        call hchksum(LmixScale, 'MEKE LmixScale', G%HI,scale=US%L_to_m)
+      endif
+
+      ! Aggregate sources of MEKE (background, frictional and GM)
       !$OMP parallel do default(shared)
       do j=js,je ; do i=is,ie
-        MEKE%MEKE(i,j) = MEKE%MEKE(i,j) + del4MEKE(i,j)
+        src(i,j) = CS%MEKE_BGsrc
       enddo ; enddo
-    endif
 
-    ! Second stage of Strang splitting
-    if (CS%MEKE_KH >= 0.0 .or. CS%MEKE_K4 >= 0.0) then
-      if (sdt>sdt_damp) then
-        ! Recalculate the drag rate, since MEKE has changed.
-        if (use_drag_rate) then
+      if (associated(MEKE%mom_src)) then
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          src(i,j) = src(i,j) - CS%MEKE_FrCoeff*I_mass(i,j)*MEKE%mom_src(i,j)
+        enddo ; enddo
+      endif
+
+      if (associated(MEKE%GME_snk)) then
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          src(i,j) = src(i,j) - CS%MEKE_GMECoeff*I_mass(i,j)*MEKE%GME_snk(i,j)
+        enddo ; enddo
+      endif
+
+      if (associated(MEKE%GM_src)) then
+        if (CS%GM_src_alt) then
           !$OMP parallel do default(shared)
           do j=js,je ; do i=is,ie
-            drag_rate(i,j) = (US%L_to_Z*Rho0 * I_mass(i,j)) * sqrt( drag_rate_visc(i,j)**2 + &
-                   cdrag2 * ( max(0.0, 2.0*bottomFac2(i,j)*MEKE%MEKE(i,j)) + CS%MEKE_Uscale**2 ) )
+            src(i,j) = src(i,j) - CS%MEKE_GMcoeff*MEKE%GM_src(i,j) / &
+                       (GV%Rho0 * MAX(1.0*US%m_to_Z, G%bathyT(i,j)))
           enddo ; enddo
+        else
           !$OMP parallel do default(shared)
           do j=js,je ; do i=is,ie
-            ldamping = CS%MEKE_damping + drag_rate(i,j) * bottomFac2(i,j)
-            if (MEKE%MEKE(i,j) < 0.) ldamping = 0.
-            ! notice that the above line ensures a damping only if MEKE is positive,
-            ! while leaving MEKE unchanged if it is negative
-            MEKE%MEKE(i,j) =  MEKE%MEKE(i,j) / (1.0 + sdt_damp*ldamping)
-            MEKE_decay(i,j) = ldamping*G%mask2dT(i,j)
+            src(i,j) = src(i,j) - CS%MEKE_GMcoeff*I_mass(i,j)*MEKE%GM_src(i,j)
           enddo ; enddo
         endif
       endif
-    endif ! MEKE_KH>=0
 
- !   do j=js,je ; do i=is,ie
- !     MEKE%MEKE(i,j) =  MAX(MEKE%MEKE(i,j),0.0)
- !   enddo ; enddo
+      if (CS%MEKE_equilibrium_restoring) then
+        call MEKE_equilibrium_restoring(CS, G, US, SN_u, SN_v)
+        do j=js,je ; do i=is,ie
+          src(i,j) = src(i,j) - CS%MEKE_restoring_rate*(MEKE%MEKE(i,j) - CS%equilibrium_value(i,j))
+        enddo ; enddo
+      endif
 
-  else ! read MEKE from file
-    call time_interp_external(CS%id_eke,Time,data_eke)
-    do j=js,je ; do i=is,ie
-      MEKE%MEKE(i,j) = data_eke(i,j) * G%mask2dT(i,j)
-    enddo; enddo
-  endif
+      ! Increase EKE by a full time-steps worth of source
+      !$OMP parallel do default(shared)
+      do j=js,je ; do i=is,ie
+        MEKE%MEKE(i,j) = (MEKE%MEKE(i,j) + sdt*src(i,j))*G%mask2dT(i,j)
+      enddo ; enddo
+
+      if (use_drag_rate) then
+        ! Calculate a viscous drag rate (includes BBL contributions from mean flow and eddies)
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          drag_rate(i,j) = (US%L_to_Z*Rho0 * I_mass(i,j)) * sqrt( drag_rate_visc(i,j)**2 + &
+                   cdrag2 * ( max(0.0, 2.0*bottomFac2(i,j)*MEKE%MEKE(i,j)) + CS%MEKE_Uscale**2 ) )
+        enddo ; enddo
+      endif
+
+      ! First stage of Strang splitting
+      !$OMP parallel do default(shared)
+      do j=js,je ; do i=is,ie
+        ldamping = CS%MEKE_damping + drag_rate(i,j) * bottomFac2(i,j)
+        if (MEKE%MEKE(i,j) < 0.) ldamping = 0.
+        ! notice that the above line ensures a damping only if MEKE is positive,
+        ! while leaving MEKE unchanged if it is negative
+        MEKE%MEKE(i,j) =  MEKE%MEKE(i,j) / (1.0 + sdt_damp*ldamping)
+        MEKE_decay(i,j) = ldamping*G%mask2dT(i,j)
+      enddo ; enddo
+
+      if (CS%kh_flux_enabled .or. CS%MEKE_K4 >= 0.0) then
+        ! Update MEKE in the halos for lateral or bi-harmonic diffusion
+        call cpu_clock_begin(CS%id_clock_pass)
+        call do_group_pass(CS%pass_MEKE, G%Domain)
+        call cpu_clock_end(CS%id_clock_pass)
+      endif
+
+      if (CS%MEKE_K4 >= 0.0) then
+        ! Calculate Laplacian of MEKE using MEKE_uflux and MEKE_vflux as temporary work space.
+        !$OMP parallel do default(shared)
+        do j=js-1,je+1 ; do I=is-2,ie+1
+          ! MEKE_uflux is used here as workspace with units of [L2 T-2 ~> m2 s-2].
+          MEKE_uflux(I,j) = ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * G%mask2dCu(I,j)) * &
+              (MEKE%MEKE(i+1,j) - MEKE%MEKE(i,j))
+        ! This would have units of [R Z L2 T-2 ~> kg s-2]
+        ! MEKE_uflux(I,j) = ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
+        !     ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
+        !     (MEKE%MEKE(i+1,j) - MEKE%MEKE(i,j))
+        enddo ; enddo
+        !$OMP parallel do default(shared)
+        do J=js-2,je+1 ; do i=is-1,ie+1
+          ! MEKE_vflux is used here as workspace with units of [L2 T-2 ~> m2 s-2].
+          MEKE_vflux(i,J) = ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * G%mask2dCv(i,J)) * &
+              (MEKE%MEKE(i,j+1) - MEKE%MEKE(i,j))
+        ! This would have units of [R Z L2 T-2 ~> kg s-2]
+        ! MEKE_vflux(i,J) = ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * &
+        !     ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
+        !     (MEKE%MEKE(i,j+1) - MEKE%MEKE(i,j))
+        enddo ; enddo
+
+        !$OMP parallel do default(shared)
+        do j=js-1,je+1 ; do i=is-1,ie+1 ! del2MEKE has units [T-2 ~> s-2].
+          del2MEKE(i,j) = G%IareaT(i,j) * &
+              ((MEKE_uflux(I,j) - MEKE_uflux(I-1,j)) + (MEKE_vflux(i,J) - MEKE_vflux(i,J-1)))
+        enddo ; enddo
+
+        ! Bi-harmonic diffusion of MEKE
+        !$OMP parallel do default(shared) private(K4_here,Inv_K4_max)
+        do j=js,je ; do I=is-1,ie
+          K4_here = CS%MEKE_K4 ! [L4 T-1 ~> m4 s-1]
+          ! Limit Kh to avoid CFL violations.
+          Inv_K4_max = 64.0 * sdt * ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
+                       max(G%IareaT(i,j), G%IareaT(i+1,j)))**2
+          if (K4_here*Inv_K4_max > 0.3) K4_here = 0.3 / Inv_K4_max
+
+          ! Here the units of MEKE_uflux are [R Z L4 T-3 ~> kg m2 s-3].
+          MEKE_uflux(I,j) = ((K4_here * (G%dy_Cu(I,j)*G%IdxCu(I,j))) * &
+              ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
+              (del2MEKE(i+1,j) - del2MEKE(i,j))
+        enddo ; enddo
+        !$OMP parallel do default(shared) private(K4_here,Inv_K4_max)
+        do J=js-1,je ; do i=is,ie
+          K4_here = CS%MEKE_K4 ! [L4 T-1 ~> m4 s-1]
+          Inv_K4_max = 64.0 * sdt * ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * max(G%IareaT(i,j), G%IareaT(i,j+1)))**2
+          if (K4_here*Inv_K4_max > 0.3) K4_here = 0.3 / Inv_K4_max
+
+          ! Here the units of MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
+          MEKE_vflux(i,J) = ((K4_here * (G%dx_Cv(i,J)*G%IdyCv(i,J))) * &
+              ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
+              (del2MEKE(i,j+1) - del2MEKE(i,j))
+        enddo ; enddo
+        ! Store change in MEKE arising from the bi-harmonic in del4MEKE [L2 T-2 ~> m2 s-2].
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          del4MEKE(i,j) = (sdt*(G%IareaT(i,j)*I_mass(i,j))) * &
+              ((MEKE_uflux(I-1,j) - MEKE_uflux(I,j)) + &
+               (MEKE_vflux(i,J-1) - MEKE_vflux(i,J)))
+        enddo ; enddo
+      endif !
+
+      if (CS%kh_flux_enabled) then
+        ! Lateral diffusion of MEKE
+        Kh_here = max(0., CS%MEKE_Kh)
+        !$OMP parallel do default(shared) firstprivate(Kh_here) private(Inv_Kh_max)
+        do j=js,je ; do I=is-1,ie
+          ! Limit Kh to avoid CFL violations.
+          if (associated(MEKE%Kh)) &
+            Kh_here = max(0., CS%MEKE_Kh) + &
+                CS%KhMEKE_Fac*0.5*(MEKE%Kh(i,j)+MEKE%Kh(i+1,j))
+          if (associated(MEKE%Kh_diff)) &
+            Kh_here = max(0.,CS%MEKE_Kh) + &
+                CS%KhMEKE_Fac*0.5*(MEKE%Kh_diff(i,j)+MEKE%Kh_diff(i+1,j))
+          Inv_Kh_max = 2.0*sdt * ((G%dy_Cu(I,j)*G%IdxCu(I,j)) * &
+                       max(G%IareaT(i,j),G%IareaT(i+1,j)))
+          if (Kh_here*Inv_Kh_max > 0.25) Kh_here = 0.25 / Inv_Kh_max
+          Kh_u(I,j) = Kh_here
+
+          ! Here the units of MEKE_uflux and MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
+          MEKE_uflux(I,j) = ((Kh_here * (G%dy_Cu(I,j)*G%IdxCu(I,j))) * &
+              ((2.0*mass(i,j)*mass(i+1,j)) / ((mass(i,j)+mass(i+1,j)) + mass_neglect)) ) * &
+              (MEKE%MEKE(i,j) - MEKE%MEKE(i+1,j))
+        enddo ; enddo
+        !$OMP parallel do default(shared) firstprivate(Kh_here) private(Inv_Kh_max)
+        do J=js-1,je ; do i=is,ie
+          if (associated(MEKE%Kh)) &
+            Kh_here = max(0.,CS%MEKE_Kh) + CS%KhMEKE_Fac * 0.5*(MEKE%Kh(i,j)+MEKE%Kh(i,j+1))
+          if (associated(MEKE%Kh_diff)) &
+            Kh_here = max(0.,CS%MEKE_Kh) + CS%KhMEKE_Fac * 0.5*(MEKE%Kh_diff(i,j)+MEKE%Kh_diff(i,j+1))
+          Inv_Kh_max = 2.0*sdt * ((G%dx_Cv(i,J)*G%IdyCv(i,J)) * max(G%IareaT(i,j),G%IareaT(i,j+1)))
+          if (Kh_here*Inv_Kh_max > 0.25) Kh_here = 0.25 / Inv_Kh_max
+          Kh_v(i,J) = Kh_here
+
+          ! Here the units of MEKE_uflux and MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
+          MEKE_vflux(i,J) = ((Kh_here * (G%dx_Cv(i,J)*G%IdyCv(i,J))) * &
+              ((2.0*mass(i,j)*mass(i,j+1)) / ((mass(i,j)+mass(i,j+1)) + mass_neglect)) ) * &
+              (MEKE%MEKE(i,j) - MEKE%MEKE(i,j+1))
+        enddo ; enddo
+        if (CS%MEKE_advection_factor>0.) then
+          advFac = CS%MEKE_advection_factor / sdt ! [T-1 ~> s-1]
+          !$OMP parallel do default(shared)
+          do j=js,je ; do I=is-1,ie
+            ! Here the units of the quantities added to MEKE_uflux are [R Z L4 T-3 ~> kg m2 s-3].
+            if (baroHu(I,j)>0.) then
+              MEKE_uflux(I,j) = MEKE_uflux(I,j) + baroHu(I,j)*MEKE%MEKE(i,j)*advFac
+            elseif (baroHu(I,j)<0.) then
+              MEKE_uflux(I,j) = MEKE_uflux(I,j) + baroHu(I,j)*MEKE%MEKE(i+1,j)*advFac
+            endif
+          enddo ; enddo
+          !$OMP parallel do default(shared)
+          do J=js-1,je ; do i=is,ie
+            ! Here the units of the quantities added to MEKE_vflux are [R Z L4 T-3 ~> kg m2 s-3].
+            if (baroHv(i,J)>0.) then
+              MEKE_vflux(i,J) = MEKE_vflux(i,J) + baroHv(i,J)*MEKE%MEKE(i,j)*advFac
+            elseif (baroHv(i,J)<0.) then
+              MEKE_vflux(i,J) = MEKE_vflux(i,J) + baroHv(i,J)*MEKE%MEKE(i,j+1)*advFac
+            endif
+          enddo ; enddo
+        endif
+
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          MEKE%MEKE(i,j) = MEKE%MEKE(i,j) + (sdt*(G%IareaT(i,j)*I_mass(i,j))) * &
+              ((MEKE_uflux(I-1,j) - MEKE_uflux(I,j)) + &
+               (MEKE_vflux(i,J-1) - MEKE_vflux(i,J)))
+        enddo ; enddo
+      endif ! MEKE_KH>0
+
+      ! Add on bi-harmonic tendency
+      if (CS%MEKE_K4 >= 0.0) then
+        !$OMP parallel do default(shared)
+        do j=js,je ; do i=is,ie
+          MEKE%MEKE(i,j) = MEKE%MEKE(i,j) + del4MEKE(i,j)
+        enddo ; enddo
+      endif
+
+      ! Second stage of Strang splitting
+      if (CS%MEKE_KH >= 0.0 .or. CS%MEKE_K4 >= 0.0) then
+        if (sdt>sdt_damp) then
+          ! Recalculate the drag rate, since MEKE has changed.
+          if (use_drag_rate) then
+            !$OMP parallel do default(shared)
+            do j=js,je ; do i=is,ie
+              drag_rate(i,j) = (US%L_to_Z*Rho0 * I_mass(i,j)) * sqrt( drag_rate_visc(i,j)**2 + &
+                     cdrag2 * ( max(0.0, 2.0*bottomFac2(i,j)*MEKE%MEKE(i,j)) + CS%MEKE_Uscale**2 ) )
+            enddo ; enddo
+            !$OMP parallel do default(shared)
+            do j=js,je ; do i=is,ie
+              ldamping = CS%MEKE_damping + drag_rate(i,j) * bottomFac2(i,j)
+              if (MEKE%MEKE(i,j) < 0.) ldamping = 0.
+              ! notice that the above line ensures a damping only if MEKE is positive,
+              ! while leaving MEKE unchanged if it is negative
+              MEKE%MEKE(i,j) =  MEKE%MEKE(i,j) / (1.0 + sdt_damp*ldamping)
+              MEKE_decay(i,j) = ldamping*G%mask2dT(i,j)
+            enddo ; enddo
+          endif
+        endif
+      endif ! MEKE_KH>=0
+
+ !     do j=js,je ; do i=is,ie
+ !       MEKE%MEKE(i,j) =  MAX(MEKE%MEKE(i,j),0.0)
+ !     enddo ; enddo
+
+    case (EKE_FILE) ! read MEKE from file
+      call time_interp_external(CS%id_eke,Time,data_eke)
+      do j=js,je ; do i=is,ie
+        MEKE%MEKE(i,j) = data_eke(i,j) * G%mask2dT(i,j)
+      enddo; enddo
+    case (EKE_SILC)
+      input_idx = 0
+      if (CS%use_mke    ) then
+        ! call calc_mke
+        CS%mke(:,:) = 0.
+        call CS%silc%put_tensor("mke"//CS%key_suffix, CS%mke, shape(CS%mke))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'mke'//CS%key_suffix
+        CS%outputs(input_idx) = 'mke_processed'//CS%key_suffix
+      endif
+      if (CS%use_slope_z) then
+        ! call calc_slope_z
+        CS%slope_z(:,:) = 0.
+        call CS%silc%put_tensor("slope_z"//CS%key_suffix, CS%slope_z, shape(CS%slope_z))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'slope_z'//CS%key_suffix
+        CS%outputs(input_idx) = 'slope_z_processed'//CS%key_suffix
+      endif
+      if (CS%use_rv_z   ) then
+        CS%rv_z(:,:) = 0.
+        ! call calc_rv_z
+        call CS%silc%put_tensor("rv_z"//CS%key_suffix, CS%rv_z, shape(CS%rv_z))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'rv_z'//CS%key_suffix
+        CS%outputs(input_idx) = 'rv_z_processed'//CS%key_suffix
+      endif
+      if (CS%use_div_sfc) then
+        ! call calc_div_sfc
+        CS%div_sfc(:,:) = 0.
+        call CS%silc%put_tensor("div_sfc"//CS%key_suffix, CS%div_sfc, shape(CS%div_sfc))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'div_sfc'//CS%key_suffix
+        CS%outputs(input_idx) = 'div_sfc_processed'//CS%key_suffix
+      endif
+      if (CS%use_def_sfc) then
+        ! call calc_def_sfc
+        CS%def_sfc(:,:) = 0.
+        call CS%silc%put_tensor("def_sfc"//CS%key_suffix, CS%def_sfc, shape(CS%def_sfc))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'def_sfc'//CS%key_suffix
+        CS%outputs(input_idx) = 'def_sfc_processed'//CS%key_suffix
+      endif
+      if (CS%use_rd_dx_z) then
+        ! call calc_rd_dx_z
+        CS%rd_dx_z(:,:) = 0.
+        call CS%silc%put_tensor("rd_dx_z"//CS%key_suffix, CS%rd_dx_z, shape(CS%rd_dx_z))
+        input_idx = input_idx + 1
+        CS%inputs(input_idx) = 'rd_dx_z'//CS%key_suffix
+        CS%outputs(input_idx) = 'rd_dx_z_processed'//CS%key_suffix
+      endif
+      call CS%silc%run_script(CS%script_name, "pre_process", CS%inputs, CS%outputs)
+      do i=1,CS%n_predictands
+        CS%inputs(i) = CS%outputs(i)
+      enddo
+      CS%EKE_key(1) = "EKE"//CS%key_suffix
+      call CS%silc%run_model(CS%model_name, CS%inputs, CS%EKE_key)
+      call CS%silc%unpack_tensor( CS%EKE_key(1), MEKE%MEKE, shape(MEKE%MEKE) )
+  end select
 
   call cpu_clock_begin(CS%id_clock_pass)
   call do_group_pass(CS%pass_MEKE, G%Domain)
@@ -1014,7 +1106,8 @@ logical function MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS)
                            ! run to the representation in a restart file.
   real    :: MEKE_restoring_timescale ! The timescale used to nudge MEKE toward its equilibrium value.
   real :: cdrag            ! The default bottom drag coefficient [nondim].
-  character(len=200) :: eke_file
+  character(len=8) :: eke_source_str
+  character(len=200) :: eke_filename
   integer :: i, j, is, ie, js, je, isd, ied, jsd, jed
   logical :: laplacian, biharmonic, useVarMix, coldStart
   ! This include declares and sets the variable "version".
@@ -1047,93 +1140,143 @@ logical function MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS)
 
   call MOM_mesg("MEKE_init: reading parameters ", 5)
 
-  call get_param(param_file, mdl, "MEKE_FROM_FILE", CS%MEKE_from_file, &
-                 "If true, reads EKE from a netCDF file.", default=.false.)
-  if (CS%MEKE_from_file) then
-    call time_interp_external_init
-    call get_param(param_file, mdl, "EKE_FILE", CS%eke_file, &
-                 "A file in which to find the surface salinity to use for restoring.", &
-                 default="eke_file.nc")
-    call get_param(param_file, mdl, "EKE_VARIABLE", CS%eke_var_name, &
-                 "The name of the surface salinity variable to read from "//&
-                 "SALT_RESTORE_FILE for restoring salinity.", &
-                 default="eke")
-    call get_param(param_file, mdl, "INPUTDIR", CS%inputdir, &
-                 "The directory in which all input files are found.", &
-                 default=".", do_not_log=.true.)
-    CS%inputdir = slasher(CS%inputdir)
+  call get_param(param_file, mdl, "EKE_SOURCE", eke_source_str, &
+                 "Determine the where EKE comes from:\n" // &
+                 "  'prog': Calculated solving EKE equation\n"// &
+                 "  'file': Read in from a file\n"            // &
+                 "  'silc': Retrieved from SILC", default='prog')
 
-    eke_file = trim(CS%inputdir) // trim(CS%eke_file)
-    CS%id_eke = init_external_field(eke_file, CS%eke_var_name, domain=G%Domain%mpp_domain)
+  select case (lowercase(eke_source_str))
+    case("file")
+      CS%eke_src = EKE_FILE
+      call time_interp_external_init
+      call get_param(param_file, mdl, "EKE_FILE", CS%eke_file, &
+                   "A file in which to find the surface salinity to use for restoring.", &
+                   default="eke_file.nc")
+      call get_param(param_file, mdl, "EKE_VARIABLE", CS%eke_var_name, &
+                   "The name of the surface salinity variable to read from "//&
+                   "SALT_RESTORE_FILE for restoring salinity.", &
+                   default="eke")
+      call get_param(param_file, mdl, "INPUTDIR", CS%inputdir, &
+                   "The directory in which all input files are found.", &
+                   default=".", do_not_log=.true.)
+      CS%inputdir = slasher(CS%inputdir)
 
-  else
-    ! Read all relevant parameters and write them to the model log.
-    call get_param(param_file, mdl, "MEKE_DAMPING", CS%MEKE_damping, &
-                   "The local depth-independent MEKE dissipation rate.", &
-                   units="s-1", default=0.0, scale=US%T_to_s)
-    call get_param(param_file, mdl, "MEKE_CD_SCALE", CS%MEKE_Cd_scale, &
-                   "The ratio of the bottom eddy velocity to the column mean "//&
-                   "eddy velocity, i.e. sqrt(2*MEKE). This should be less than 1 "//&
-                   "to account for the surface intensification of MEKE.", &
-                   units="nondim", default=0.)
-    call get_param(param_file, mdl, "MEKE_CB", CS%MEKE_Cb, &
-                   "A coefficient in the expression for the ratio of bottom projected "//&
-                   "eddy energy and mean column energy (see Jansen et al. 2015).",&
-                   units="nondim", default=25.)
-    call get_param(param_file, mdl, "MEKE_MIN_GAMMA2", CS%MEKE_min_gamma, &
-                   "The minimum allowed value of gamma_b^2.",&
-                   units="nondim", default=0.0001)
-    call get_param(param_file, mdl, "MEKE_CT", CS%MEKE_Ct, &
-                   "A coefficient in the expression for the ratio of barotropic "//&
-                   "eddy energy and mean column energy (see Jansen et al. 2015).",&
-                   units="nondim", default=50.)
-    call get_param(param_file, mdl, "MEKE_GMCOEFF", CS%MEKE_GMcoeff, &
-                   "The efficiency of the conversion of potential energy "//&
-                   "into MEKE by the thickness mixing parameterization. "//&
-                   "If MEKE_GMCOEFF is negative, this conversion is not "//&
-                   "used or calculated.", units="nondim", default=-1.0)
-    call get_param(param_file, mdl, "MEKE_GEOMETRIC", CS%MEKE_GEOMETRIC, &
-                   "If MEKE_GEOMETRIC is true, uses the GM coefficient formulation "//&
-                   "from the GEOMETRIC framework (Marshall et al., 2012).", default=.false.)
-    call get_param(param_file, mdl, "MEKE_GEOMETRIC_ALPHA", CS%MEKE_GEOMETRIC_alpha, &
-                   "The nondimensional coefficient governing the efficiency of the GEOMETRIC \n"//&
-                   "thickness diffusion.", units="nondim", default=0.05)
-    call get_param(param_file, mdl, "MEKE_EQUILIBRIUM_ALT", CS%MEKE_equilibrium_alt, &
-                   "If true, use an alternative formula for computing the (equilibrium)"//&
-                   "initial value of MEKE.", default=.false.)
-    call get_param(param_file, mdl, "MEKE_EQUILIBRIUM_RESTORING", CS%MEKE_equilibrium_restoring, &
-                   "If true, restore MEKE back to its equilibrium value, which is calculated at "//&
-                   "each time step.", default=.false.)
-    if (CS%MEKE_equilibrium_restoring) then
-      call get_param(param_file, mdl, "MEKE_RESTORING_TIMESCALE", MEKE_restoring_timescale, &
-                     "The timescale used to nudge MEKE toward its equilibrium value.", units="s", &
-                     default=1e6, scale=US%T_to_s)
-      CS%MEKE_restoring_rate = 1.0 / MEKE_restoring_timescale
-    endif
+      eke_filename = trim(CS%inputdir) // trim(CS%eke_file)
+      CS%id_eke = init_external_field(eke_filename, CS%eke_var_name, domain=G%Domain%mpp_domain)
+    case ("silc")
+      CS%eke_src = EKE_SILC
+      CS%n_predictands = 0
+      call CS%silc%initialize(.true.)
+      write(CS%key_suffix, '(A,I6.6)'), '_', PE_here()
+      call get_param(param_file, mdl, "USE_MKE", CS%use_mke, &
+                   "If true, use MKE as a predictand for EKE", default=.true.)
+      if (CS%use_mke) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%mke(isd:ied,jsd:jed)) ; CS%mke(:,:) = 0.
+      endif
 
-    call get_param(param_file, mdl, "MEKE_FRCOEFF", CS%MEKE_FrCoeff, &
-                   "The efficiency of the conversion of mean energy into "//&
-                   "MEKE.  If MEKE_FRCOEFF is negative, this conversion "//&
-                   "is not used or calculated.", units="nondim", default=-1.0)
-    call get_param(param_file, mdl, "MEKE_GMECOEFF", CS%MEKE_GMECoeff, &
-                   "The efficiency of the conversion of MEKE into mean energy "//&
-                   "by GME.  If MEKE_GMECOEFF is negative, this conversion "//&
-                   "is not used or calculated.", units="nondim", default=-1.0)
-    call get_param(param_file, mdl, "MEKE_BGSRC", CS%MEKE_BGsrc, &
-                   "A background energy source for MEKE.", units="W kg-1", &
-                   default=0.0, scale=US%m_to_L**2*US%T_to_s**3)
-    call get_param(param_file, mdl, "MEKE_KH", CS%MEKE_Kh, &
-                   "A background lateral diffusivity of MEKE. "//&
-                   "Use a negative value to not apply lateral diffusion to MEKE.", &
-                   units="m2 s-1", default=-1.0, scale=US%m_to_L**2*US%T_to_s)
-    call get_param(param_file, mdl, "MEKE_K4", CS%MEKE_K4, &
-                   "A lateral bi-harmonic diffusivity of MEKE. "//&
-                   "Use a negative value to not apply bi-harmonic diffusion to MEKE.", &
-                   units="m4 s-1", default=-1.0, scale=US%m_to_L**4*US%T_to_s)
-    call get_param(param_file, mdl, "MEKE_DTSCALE", CS%MEKE_dtScale, &
-                   "A scaling factor to accelerate the time evolution of MEKE.", &
-                   units="nondim", default=1.0)
-  endif ! MEKE_from_file
+      call get_param(param_file, mdl, "USE_SLOPE_Z", CS%use_slope_z, &
+                   "If true, use vertically averaged slope as a predictand for EKE", default=.true.)
+      if (CS%use_slope_z) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%slope_z(isd:ied,jsd:jed)) ; CS%slope_z(:,:) = 0.
+      endif
+      call get_param(param_file, mdl, "USE_RV_Z", CS%use_rv_z, &
+                   "If true, use vertically averaged relative vorticity as a predictand for EKE", default=.true.)
+      if (CS%use_rv_z) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%rv_z(isd:ied,jsd:jed)) ; CS%rv_z(:,:) = 0.
+      endif
+      call get_param(param_file, mdl, "USE_DIV_SFC", CS%use_div_sfc, &
+                   "If true, use surface divergence as a predictand for EKE", default=.true.)
+      if (CS%use_div_sfc) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%div_sfc(isd:ied,jsd:jed)) ; CS%div_sfc(:,:) = 0.
+      endif
+      call get_param(param_file, mdl, "USE_DEF_SFC", CS%use_def_sfc, &
+                   "If true, use surface deformation as a predictand for EKE", default=.true.)
+      if (CS%use_def_sfc) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%def_sfc(isd:ied,jsd:jed)) ; CS%def_sfc(:,:) = 0.
+      endif
+      call get_param(param_file, mdl, "USE_RD_DX_Z", CS%use_rd_dx_z, &
+                   "If true, use Rossby radius divided by grid spacing for EKE", default=.true.)
+      if (CS%use_rd_dx_z) then
+        CS%n_predictands = CS%n_predictands+1
+        allocate(CS%rd_dx_z(isd:ied,jsd:jed)) ; CS%rd_dx_z(:,:) = 0.
+      endif
+      allocate(CS%inputs(CS%n_predictands))
+      allocate(CS%outputs(CS%n_predictands))
+    case default
+      CS%eke_src = EKE_PROG
+      ! Read all relevant parameters and write them to the model log.
+      call get_param(param_file, mdl, "MEKE_DAMPING", CS%MEKE_damping, &
+                     "The local depth-independent MEKE dissipation rate.", &
+                     units="s-1", default=0.0, scale=US%T_to_s)
+      call get_param(param_file, mdl, "MEKE_CD_SCALE", CS%MEKE_Cd_scale, &
+                     "The ratio of the bottom eddy velocity to the column mean "//&
+                     "eddy velocity, i.e. sqrt(2*MEKE). This should be less than 1 "//&
+                     "to account for the surface intensification of MEKE.", &
+                     units="nondim", default=0.)
+      call get_param(param_file, mdl, "MEKE_CB", CS%MEKE_Cb, &
+                     "A coefficient in the expression for the ratio of bottom projected "//&
+                     "eddy energy and mean column energy (see Jansen et al. 2015).",&
+                     units="nondim", default=25.)
+      call get_param(param_file, mdl, "MEKE_MIN_GAMMA2", CS%MEKE_min_gamma, &
+                     "The minimum allowed value of gamma_b^2.",&
+                     units="nondim", default=0.0001)
+      call get_param(param_file, mdl, "MEKE_CT", CS%MEKE_Ct, &
+                     "A coefficient in the expression for the ratio of barotropic "//&
+                     "eddy energy and mean column energy (see Jansen et al. 2015).",&
+                     units="nondim", default=50.)
+      call get_param(param_file, mdl, "MEKE_GMCOEFF", CS%MEKE_GMcoeff, &
+                     "The efficiency of the conversion of potential energy "//&
+                     "into MEKE by the thickness mixing parameterization. "//&
+                     "If MEKE_GMCOEFF is negative, this conversion is not "//&
+                     "used or calculated.", units="nondim", default=-1.0)
+      call get_param(param_file, mdl, "MEKE_GEOMETRIC", CS%MEKE_GEOMETRIC, &
+                     "If MEKE_GEOMETRIC is true, uses the GM coefficient formulation "//&
+                     "from the GEOMETRIC framework (Marshall et al., 2012).", default=.false.)
+      call get_param(param_file, mdl, "MEKE_GEOMETRIC_ALPHA", CS%MEKE_GEOMETRIC_alpha, &
+                     "The nondimensional coefficient governing the efficiency of the GEOMETRIC \n"//&
+                     "thickness diffusion.", units="nondim", default=0.05)
+      call get_param(param_file, mdl, "MEKE_EQUILIBRIUM_ALT", CS%MEKE_equilibrium_alt, &
+                     "If true, use an alternative formula for computing the (equilibrium)"//&
+                     "initial value of MEKE.", default=.false.)
+      call get_param(param_file, mdl, "MEKE_EQUILIBRIUM_RESTORING", CS%MEKE_equilibrium_restoring, &
+                     "If true, restore MEKE back to its equilibrium value, which is calculated at "//&
+                     "each time step.", default=.false.)
+      if (CS%MEKE_equilibrium_restoring) then
+        call get_param(param_file, mdl, "MEKE_RESTORING_TIMESCALE", MEKE_restoring_timescale, &
+                       "The timescale used to nudge MEKE toward its equilibrium value.", units="s", &
+                       default=1e6, scale=US%T_to_s)
+        CS%MEKE_restoring_rate = 1.0 / MEKE_restoring_timescale
+      endif
+
+      call get_param(param_file, mdl, "MEKE_FRCOEFF", CS%MEKE_FrCoeff, &
+                     "The efficiency of the conversion of mean energy into "//&
+                     "MEKE.  If MEKE_FRCOEFF is negative, this conversion "//&
+                     "is not used or calculated.", units="nondim", default=-1.0)
+      call get_param(param_file, mdl, "MEKE_GMECOEFF", CS%MEKE_GMECoeff, &
+                     "The efficiency of the conversion of MEKE into mean energy "//&
+                     "by GME.  If MEKE_GMECOEFF is negative, this conversion "//&
+                     "is not used or calculated.", units="nondim", default=-1.0)
+      call get_param(param_file, mdl, "MEKE_BGSRC", CS%MEKE_BGsrc, &
+                     "A background energy source for MEKE.", units="W kg-1", &
+                     default=0.0, scale=US%m_to_L**2*US%T_to_s**3)
+      call get_param(param_file, mdl, "MEKE_KH", CS%MEKE_Kh, &
+                     "A background lateral diffusivity of MEKE. "//&
+                     "Use a negative value to not apply lateral diffusion to MEKE.", &
+                     units="m2 s-1", default=-1.0, scale=US%m_to_L**2*US%T_to_s)
+      call get_param(param_file, mdl, "MEKE_K4", CS%MEKE_K4, &
+                     "A lateral bi-harmonic diffusivity of MEKE. "//&
+                     "Use a negative value to not apply bi-harmonic diffusion to MEKE.", &
+                     units="m4 s-1", default=-1.0, scale=US%m_to_L**4*US%T_to_s)
+      call get_param(param_file, mdl, "MEKE_DTSCALE", CS%MEKE_dtScale, &
+                     "A scaling factor to accelerate the time evolution of MEKE.", &
+                     units="nondim", default=1.0)
+    end select
   ! GMM, make sure all params used to calculated MEKE are within the above if
 
   call get_param(param_file, mdl, "MEKE_KHCOEFF", CS%MEKE_KhCoeff, &
@@ -1483,6 +1626,44 @@ subroutine MEKE_end(MEKE, CS)
   deallocate(MEKE)
 
 end subroutine MEKE_end
+
+!> Compute thickness weighted average of a column quantity
+real function vertical_average(h, uh)
+
+  real, dimension(:) :: h  !< Layer Thicknesses
+  real, dimension(:) :: uh !< Quantity to average
+
+  real :: htot
+  integer :: k, nk
+
+  nk = size(h)
+  htot = 0.
+  do k=1,nk
+    htot = htot + h(k)
+  enddo
+
+  vertical_average = 0.
+  do k=1,nk
+    vertical_average = vertical_average + (h(k)/htot)*uh(k)
+  enddo
+end function vertical_average
+
+!> Compute vertical integral of a column quantitity
+real function vertical_integral(h, uh)
+
+  real, dimension(:) :: h  !< Layer Thicknesses
+  real, dimension(:) :: uh !< Quantity to average
+
+  real :: htot
+  integer :: k, nk
+
+  nk = size(h)
+
+  vertical_integral = 0.
+  do k=1,nk
+    vertical_integral = vertical_integral + h(k)*uh(k)
+  enddo
+end function vertical_integral
 
 !> \namespace mom_meke
 !!
