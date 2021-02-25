@@ -1713,6 +1713,7 @@ subroutine MEKE_end(MEKE, CS)
   type(MEKE_type), pointer :: MEKE !< A structure with MEKE-related fields.
   type(MEKE_CS),   pointer :: CS   !< The control structure for MOM_MEKE.
 
+  if (CS%eke_src == EKE_SILC) call CS%silc%destructor() 
   if (associated(CS)) deallocate(CS)
 
   if (.not.associated(MEKE)) return
