@@ -1708,6 +1708,9 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   type(time_type)                 :: Start_time
   type(ocean_internal_state)      :: MOM_internal_state
   character(len=200) :: area_varname, ice_shelf_file, inputdir, filename
+  real, allocatable, dimension(:,:,:) :: randoms
+  real :: perturb_amp
+  logical :: perturb_temp
 
   if (associated(CS)) then
     call MOM_error(WARNING, "initialize_MOM called with an associated "// &
@@ -1938,6 +1941,14 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
     call get_param(param_file, "MOM", "USE_PSURF_IN_EOS", CS%use_p_surf_in_EOS, &
                  "If true, always include the surface pressure contributions "//&
                  "in equation of state calculations.", default=.true.)
+    call get_param(param_file, "MOM", "PERTURB_TEMP", perturb_temp, &
+                 "If, true, perturb the initial temperatures by a small amount" &
+                 , default=.true.)
+    if (perturb_temp) then
+      call get_param(param_file, "MOM", "PERTURB_TEMP_AMP", perturb_amp, &
+                   "Set the size of the temperature perturbation", &
+                   default=0.00001)
+    endif
   endif
   if (use_EOS) call get_param(param_file, "MOM", "P_REF", CS%tv%P_Ref, &
                  "The pressure that is used for calculating the coordinate "//&
@@ -2763,6 +2774,15 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
 
   if (CS%ensemble_ocean) then
     call init_oda(Time, G, GV, CS%odaCS)
+  endif
+
+  if (use_temperature .and. perturb_temp) then
+    allocate(randoms(isd:ied,jsd:jed,nz))
+    call random_number(randoms)
+    do k=1,GV%ke; do j=js,je; do i=is,ie
+      CS%tv%T(i,j,k) = CS%tv%T(i,j,k) + randoms(i,j,k)*perturb_amp
+    enddo; enddo; enddo
+    deallocate(randoms)
   endif
 
   !### This could perhaps go here instead of in finish_MOM_initialization?
