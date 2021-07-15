@@ -132,6 +132,10 @@ use MOM_wave_interface,        only : Update_Stokes_Drift
 ! ODA modules
 use MOM_oda_driver_mod,        only : ODA_CS, oda, init_oda, oda_end
 use MOM_oda_driver_mod,        only : set_prior_tracer, set_analysis_time, apply_oda_tracer_increments
+
+! Machine-learning models
+use MOM_smartredis,            only : client_type
+
 ! Offline modules
 use MOM_offline_main,          only : offline_transport_CS, offline_transport_init, update_offline_fields
 use MOM_offline_main,          only : insert_offline_main, extract_offline_main, post_offline_convergence_diags
@@ -382,6 +386,7 @@ type, public :: MOM_control_struct ; private
   type(ODA_CS), pointer :: odaCS => NULL() !< a pointer to the control structure for handling
                                 !! ensemble model state vectors and data assimilation
                                 !! increments and priors
+  type(client_type) :: client   !< The SmartRedis client used to communicate with the database
 end type MOM_control_struct
 
 public initialize_MOM, finish_MOM_initialization, MOM_end
@@ -1124,7 +1129,7 @@ subroutine step_MOM_dynamics(forces, p_surf_begin, p_surf_end, dt, dt_thermo, &
 
   if (CS%useMEKE .and. CS%MEKE_in_dynamics) call step_forward_MEKE(CS%MEKE, h, CS%VarMix%SN_u, CS%VarMix%SN_v, &
                                 CS%visc, dt, G, GV, US, CS%MEKE_CSp, CS%uhtr, CS%vhtr, &
-                                CS%u, CS%v, CS%tv, Time_local)
+                                CS%u, CS%v, CS%tv, Time_local, CS%client)
   call disable_averaging(CS%diag)
 
   ! Advance the dynamics time by dt.
@@ -1193,7 +1198,7 @@ subroutine step_MOM_tracer_dyn(CS, G, GV, US, h, Time_local)
   if (CS%useMEKE .and. (.not. CS%MEKE_in_dynamics)) &
     call step_forward_MEKE(CS%MEKE, h, CS%VarMix%SN_u, CS%VarMix%SN_v, &
                            CS%visc, CS%t_dyn_rel_adv, G, GV, US, CS%MEKE_CSp, CS%uhtr, CS%vhtr, &
-                           CS%u, CS%v, CS%tv, Time_local)
+                           CS%u, CS%v, CS%tv, Time_local, CS%client)
 
   call cpu_clock_begin(id_clock_other) ; call cpu_clock_begin(id_clock_diagnostics)
   call post_transport_diagnostics(G, GV, US, CS%uhtr, CS%vhtr, h, CS%transport_IDs, &
@@ -2615,7 +2620,7 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   call cpu_clock_end(id_clock_MOM_init)
   call callTree_waypoint("ALE initialized (initialize_MOM)")
 
-  call MEKE_init(Time, G, US, param_file, diag, CS%MEKE_CSp, CS%MEKE, restart_CSp, CS%useMEKE, CS%MEKE_in_dynamics)
+  call MEKE_init(Time, G, US, param_file, diag, CS%client, CS%MEKE_CSp, CS%MEKE, restart_CSp, CS%useMEKE, CS%MEKE_in_dynamics)
 
   call VarMix_init(Time, G, GV, US, param_file, diag, CS%VarMix)
   call set_visc_init(Time, G, GV, US, param_file, diag, CS%visc, CS%set_visc_CSp, restart_CSp, CS%OBC)

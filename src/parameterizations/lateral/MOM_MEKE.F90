@@ -19,7 +19,7 @@ use MOM_hor_index,        only : hor_index_type
 use MOM_interface_heights, only : find_eta
 use MOM_io,               only : vardesc, var_desc, slasher
 use MOM_time_manager,     only : time_type_to_real
-use silc_client,          only : client_type
+use MOM_smartredis,       only : client_type
 use MOM_string_functions, only : lowercase
 use MOM_restart,          only : MOM_restart_CS, register_restart_field, query_initialized
 use MOM_unit_scaling,     only : unit_scale_type
@@ -44,7 +44,7 @@ enum, bind(c)
 
   enumerator :: EKE_PROG
   enumerator :: EKE_FILE
-  enumerator :: EKE_SILC
+  enumerator :: EKE_SMARTREDIS
 
 end enum
 
@@ -111,9 +111,8 @@ type, public :: MEKE_CS ; private
   character(len=200)       :: eke_file !< filename for eke data
   character(len=30)        :: eke_var_name !< name of variable in ncfile
   integer :: eke_src !< Integer specifying whether EKE is stepped forward prognostically (default, 0),
-                     !! read in from a file (1), or inferred using the SILC client (2)
+                     !! read in from a file (1), or inferred using the SMARTREDIS client (2)
   ! Inferring EKE from ML
-  type(client_type) :: silc
   logical :: use_mke     !< If true, use mean kinetic energy when predicting EKE
   logical :: use_slope_z !< If true, use vertically averaged slope when predicting EKE
   logical :: use_rv_z    !< If true, use relative vorticity when predicting EKE
@@ -162,7 +161,7 @@ contains
 
 !> Integrates forward-in-time the MEKE eddy energy equation.
 !! See \ref section_MEKE_equations.
-subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, hv, u, v, tv, Time)
+subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, hv, u, v, tv, Time, client)
   type(MEKE_type),                          pointer       :: MEKE !< MEKE data.
   type(ocean_grid_type),                    intent(inout) :: G    !< Ocean grid.
   type(verticalGrid_type),                  intent(in)    :: GV   !< Ocean vertical grid structure.
@@ -179,6 +178,7 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
   real, dimension(SZI_(G),SZJB_(G),SZK_(G)), intent(inout)   :: v    !< Meridional velocity
   type(thermo_var_ptrs),                    intent(in)    :: tv   !< Type containing thermodynamic variables
   type(time_type),                          intent(in)    :: Time !< The time used for interpolating EKE
+  type(client_type),                        intent(in)    :: client !< The SmartRedis client used for ML_EKE
 
   ! Local variables
   real(kind=8), dimension(SZI_(G),SZJ_(G)) :: &
@@ -626,7 +626,7 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
       do j=js,je ; do i=is,ie
         MEKE%MEKE(i,j) = data_eke(i,j) * G%mask2dT(i,j)
       enddo; enddo
-    case (EKE_SILC)
+    case (EKE_SMARTREDIS)
       call MEKE_lengthScales(CS, MEKE, G, GV, US, SN_u, SN_v, MEKE%MEKE, bottomFac2, barotrFac2, LmixScale)
       call pass_vector(u, v, G%Domain)
       ! Linear interpolation to estimate thickness at a velocity points
@@ -644,7 +644,6 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
           CS%mke(i,j) = 0.5*( u_t*u_t + v_t*v_t )
         enddo; enddo
         if (CS%id_mke>0) call post_data(CS%id_mke, CS%mke, CS%diag)
-        ! call CS%silc%put_tensor("mke"//CS%key_suffix, CS%mke, shape(CS%mke))
         input_idx = input_idx + 1
         CS%features_array(:,input_idx) = pack(CS%mke,.true.)
         preprocess_in(input_idx) = 'mke'//CS%key_suffix
@@ -677,14 +676,12 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
         if (CS%id_slope_x>0) call post_data(CS%id_slope_x, slope_x, CS%diag)
         if (CS%id_slope_y>0) call post_data(CS%id_slope_y, slope_y, CS%diag)
         call pass_var(CS%slope_z, G%Domain)
-        ! call CS%silc%put_tensor("slope_z"//CS%key_suffix, CS%slope_z, shape(CS%slope_z))
         input_idx = input_idx + 1
         CS%features_array(:,input_idx) = pack(CS%slope_z,.true.)
         preprocess_in(input_idx) = 'slope_z'//CS%key_suffix
       endif
       if (CS%use_rd_dx_z) then
         call pass_var(MEKE%Rd_dx_h, G%Domain)
-        ! call CS%silc%put_tensor("rd_dx_z"//CS%key_suffix, MEKE%Rd_dx_h, shape(MEKE%Rd_dx_h))
         input_idx = input_idx + 1
         preprocess_in(input_idx) = 'rd_dx_z'//CS%key_suffix
         CS%features_array(:,input_idx) = pack(MEKE%Rd_dx_h,.true.)
@@ -698,7 +695,6 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
         enddo; enddo
         ! call calc_rv_z
         if (CS%id_rv>0) call post_data(CS%id_rv, CS%rv_z, CS%diag)
-        !        call CS%silc%put_tensor("rv_sfc"//CS%key_suffix, CS%rv_z, shape(CS%rv_z))
         input_idx = input_idx + 1
         CS%features_array(:,input_idx) = pack(CS%rv_z,.true.)
         preprocess_in(input_idx) = 'rv_sfc'//CS%key_suffix
@@ -706,39 +702,31 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
       if (CS%use_div_sfc) then
         ! call calc_div_sfc
         CS%div_sfc(:,:) = 0.
-        call CS%silc%put_tensor("div_sfc"//CS%key_suffix, CS%div_sfc, shape(CS%div_sfc))
+        call client%put_tensor("div_sfc"//CS%key_suffix, CS%div_sfc, shape(CS%div_sfc))
         input_idx = input_idx + 1
         CS%inputs(input_idx) = 'div_sfc'//CS%key_suffix
       endif
       if (CS%use_def_sfc) then
         ! call calc_def_sfc
         CS%def_sfc(:,:) = 0.
-        call CS%silc%put_tensor("def_sfc"//CS%key_suffix, CS%def_sfc, shape(CS%def_sfc))
+        call client%put_tensor("def_sfc"//CS%key_suffix, CS%def_sfc, shape(CS%def_sfc))
         input_idx = input_idx + 1
         CS%inputs(input_idx) = 'def_sfc'//CS%key_suffix
       endif
       call cpu_clock_begin(CS%id_put_tensor)
-      call CS%silc%put_tensor("features"//CS%key_suffix, CS%features_array, shape(CS%features_array))
+      call client%put_tensor("features"//CS%key_suffix, CS%features_array, shape(CS%features_array))
       call cpu_clock_end(CS%id_put_tensor)
-!      preprocess_out(1) = "features_processed"//CS%key_suffix
-!      call CS%silc%run_script(CS%script_key, "preprocess_features", preprocess_in, preprocess_out)
-!      model_in(1) = preprocess_out(1)
       model_out(1) = "EKE"//CS%key_suffix
       model_in(1) = "features"//CS%key_suffix
       call cpu_clock_begin(CS%id_run_model)
-      call CS%silc%run_model(CS%model_key, model_in, model_out)
+      call client%run_model(CS%model_key, model_in, model_out)
       call cpu_clock_end(CS%id_run_model)
       postprocess_in(1) = model_out(1)
       postprocess_in(2) = "EKE_shape"//CS%key_suffix
       postprocess_out(1) = "EKE_2D"//CS%key_suffix
 
-!      call cpu_clock_begin(CS%id_run_script)
-!      call CS%silc%run_script(CS%script_key, "postprocess_eke", postprocess_in, postprocess_out)
-!      call cpu_clock_end(CS%id_run_script)
-
       call cpu_clock_begin(CS%id_unpack_tensor)
-!      call CS%silc%unpack_tensor( postprocess_out(1), MEKE%MEKE, shape(MEKE%MEKE) )
-      call CS%silc%unpack_tensor( model_out(1), CS%MEKE_vec, shape(CS%MEKE_vec) )
+      call client%unpack_tensor( model_out(1), CS%MEKE_vec, shape(CS%MEKE_vec) )
       call cpu_clock_end(CS%id_unpack_tensor)
       MEKE%MEKE = reshape(CS%MEKE_vec, shape(MEKE%MEKE))
       do j=js,je; do i=is,ie
@@ -748,9 +736,9 @@ subroutine step_forward_MEKE(MEKE, h, SN_u, SN_v, visc, dt, G, GV, US, CS, hu, h
       write(time_suffix,"(F16.0)") time_type_to_real(Time)
 
       call pass_var(MEKE%MEKE,G%Domain)
-      call CS%silc%put_tensor(trim("RV_")//trim(adjustl(time_suffix))//CS%key_suffix,  CS%rv_z,shape(CS%rv_z))
-      call CS%silc%put_tensor(trim("EKE_")//trim(adjustl(time_suffix))//CS%key_suffix, MEKE%MEKE,shape(MEKE%MEKE))
-      call CS%silc%put_tensor(trim("MKE_")//trim(adjustl(time_suffix))//CS%key_suffix, CS%mke,shape(CS%mke))
+      call client%put_tensor(trim("RV_")//trim(adjustl(time_suffix))//CS%key_suffix,  CS%rv_z,shape(CS%rv_z))
+      call client%put_tensor(trim("EKE_")//trim(adjustl(time_suffix))//CS%key_suffix, MEKE%MEKE,shape(MEKE%MEKE))
+      call client%put_tensor(trim("MKE_")//trim(adjustl(time_suffix))//CS%key_suffix, CS%mke,shape(CS%mke))
 
   end select
 
@@ -1196,11 +1184,12 @@ end subroutine MEKE_lengthScales_0d
 
 !> Initializes the MOM_MEKE module and reads parameters.
 !! Returns True if module is to be used, otherwise returns False.
-subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_meke, meke_in_dynamics)
+subroutine MEKE_init(Time, G, US, param_file, diag, client, CS, MEKE, restart_CS, use_meke, meke_in_dynamics)
   type(time_type),         intent(in)    :: Time       !< The current model time.
   type(ocean_grid_type),   intent(inout) :: G          !< The ocean's grid structure.
   type(unit_scale_type),   intent(in)    :: US         !< A dimensional unit scaling type
   type(param_file_type),   intent(in)    :: param_file !< Parameter file parser structure.
+  type(client_type),       intent(in)    :: client     !< SmartRedis client
   type(diag_ctrl), target, intent(inout) :: diag       !< Diagnostics structure.
   type(MEKE_CS),           pointer       :: CS         !< MEKE control structure.
   type(MEKE_type),         pointer       :: MEKE       !< MEKE-related fields.
@@ -1223,6 +1212,7 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
   ! This include declares and sets the variable "version".
 # include "version_variable.h"
   character(len=40)  :: mdl = "MOM_MEKE" ! This module's name.
+  character(len=3)   :: backend
   integer :: batch_size
 
   is = G%isc ; ie = G%iec ; js = G%jsc ; je = G%jec
@@ -1260,7 +1250,7 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
                  "Determine the where EKE comes from:\n" // &
                  "  'prog': Calculated solving EKE equation\n"// &
                  "  'file': Read in from a file\n"            // &
-                 "  'silc': Retrieved from SILC", default='prog')
+                 "  'smartredis': Retrieved from SMARTREDIS", default='prog')
 
   select case (lowercase(eke_source_str))
     case("file")
@@ -1280,18 +1270,14 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
 
       eke_filename = trim(CS%inputdir) // trim(CS%eke_file)
       CS%id_eke = init_external_field(eke_filename, CS%eke_var_name, domain=G%Domain%mpp_domain)
-    case ("silc")
-      CS%id_client_init = cpu_clock_id('(SILC client init)', grain=CLOCK_ROUTINE)
-      CS%eke_src = EKE_SILC
+    case ("smartredis")
+      CS%eke_src = EKE_SMARTREDIS
       CS%n_predictands = 0
-      call cpu_clock_begin(CS%id_client_init)
-      call CS%silc%initialize(.true.)
-      call cpu_clock_end(CS%id_client_init)
       write(CS%key_suffix, '(A,I6.6)') '_', PE_here()
-      call CS%silc%put_tensor("meta"//CS%key_suffix,&
+      call client%put_tensor("meta"//CS%key_suffix,&
         REAL([G%isd_global, G%idg_offset, G%jsd_global, G%jdg_offset]),[4])
-      call CS%silc%put_tensor("geolat"//CS%key_suffix, G%geoLatT, shape(G%geoLatT))
-      call CS%silc%put_tensor("geolon"//CS%key_suffix, G%geoLonT, shape(G%geoLonT))
+      call client%put_tensor("geolat"//CS%key_suffix, G%geoLatT, shape(G%geoLatT))
+      call client%put_tensor("geolon"//CS%key_suffix, G%geoLonT, shape(G%geoLonT))
       call get_param(param_file, mdl, "INPUTDIR", CS%inputdir, &
                    "The directory in which all input files are found.", &
                    default=".", do_not_log=.true.)
@@ -1299,17 +1285,19 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
 
       call get_param(param_file, mdl, "BATCH_SIZE", batch_size, &
                    "Batch size to use for inference", default=1)
+      call get_param(param_file, mdl, "EKE_BACKEND", backend, &
+                   "The computational backend to use for EKE inference (CPU or GPU)", default="GPU")
 
-      call get_param(param_file, mdl, "SILC_MODEL", model_filename, &
+      call get_param(param_file, mdl, "EKE_MODEL", model_filename, &
                      "Filename of the a saved pyTorch model to use", default='')
       if (len_trim(model_filename) > 0 .and. is_root_pe()) then
-        call CS%silc%set_model_from_file(CS%model_key, trim(CS%inputdir)//trim(model_filename), "TORCH", "GPU", &
+        call client%set_model_from_file(CS%model_key, trim(CS%inputdir)//trim(model_filename), "TORCH", backend, &
                                          batch_size=batch_size)
       endif
-      call get_param(param_file, mdl, "SILC_PREPROCESS_SCRIPT", script_filename, &
+      call get_param(param_file, mdl, "EKE_PREPROCESS_SCRIPT", script_filename, &
                      "Filename of the preprocessing script", default='')
       if (len_trim(script_filename) > 0 .and. is_root_pe()) then
-        call CS%silc%set_script_from_file(CS%script_key, "GPU", trim(CS%inputdir)//script_filename)
+        call client%set_script_from_file(CS%script_key, "GPU", trim(CS%inputdir)//script_filename)
       endif
       call get_param(param_file, mdl, "USE_MKE", CS%use_mke, &
                    "If true, use MKE as a predictand for EKE", default=.true.)
@@ -1349,7 +1337,7 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
       endif
       allocate(CS%inputs(CS%n_predictands))
       allocate(CS%outputs(CS%n_predictands))
-      call CS%silc%put_tensor("EKE_shape"//CS%key_suffix, shape(MEKE%MEKE), [2])
+      call client%put_tensor("EKE_shape"//CS%key_suffix, shape(MEKE%MEKE), [2])
 
       allocate(CS%features_array(size(MEKE%MEKE),CS%n_predictands))
       allocate(CS%MEKE_vec(size(MEKE%MEKE)))
@@ -1546,7 +1534,7 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
 
 ! Register fields for output from this module.
   CS%diag => diag
-  ! Diagnostics for SILC
+  ! Diagnostics for SMARTREDIS
   CS%id_mke = register_diag_field('ocean_model', 'MEKE_MKE', diag%axesT1, Time, &
      'Mean Kinetic Energy', 'm2 s-2', conversion=US%L_T_to_m_s**2)
   CS%id_slope_z= register_diag_field('ocean_model', 'MEKE_slope_z', diag%axesT1, Time, &
@@ -1618,11 +1606,11 @@ subroutine MEKE_init(Time, G, US, param_file, diag, CS, MEKE, restart_CS, use_me
   endif
 
   CS%id_clock_pass = cpu_clock_id('(Ocean continuity halo updates)', grain=CLOCK_ROUTINE)
-  CS%id_client_init = cpu_clock_id('(SILC client init)', grain=CLOCK_ROUTINE)
-  CS%id_put_tensor = cpu_clock_id('(SILC put tensor)', grain=CLOCK_ROUTINE)
-  CS%id_run_model= cpu_clock_id('(SILC run model)', grain=CLOCK_ROUTINE)
-  CS%id_run_script= cpu_clock_id('(SILC run script)', grain=CLOCK_ROUTINE)
-  CS%id_unpack_tensor = cpu_clock_id('(SILC unpack tensor )', grain=CLOCK_ROUTINE)
+  CS%id_client_init = cpu_clock_id('(SMARTREDIS client init)', grain=CLOCK_ROUTINE)
+  CS%id_put_tensor = cpu_clock_id('(SMARTREDIS put tensor)', grain=CLOCK_ROUTINE)
+  CS%id_run_model= cpu_clock_id('(SMARTREDIS run model)', grain=CLOCK_ROUTINE)
+  CS%id_run_script= cpu_clock_id('(SMARTREDIS run script)', grain=CLOCK_ROUTINE)
+  CS%id_unpack_tensor = cpu_clock_id('(SMARTREDIS unpack tensor )', grain=CLOCK_ROUTINE)
   ! Detect whether this instance of MEKE_init() is at the beginning of a run
   ! or after a restart. If at the beginning, we will initialize MEKE to a local
   ! equilibrium.
@@ -1772,7 +1760,6 @@ subroutine MEKE_end(MEKE, CS)
   type(MEKE_type), pointer :: MEKE !< A structure with MEKE-related fields.
   type(MEKE_CS),   pointer :: CS   !< The control structure for MOM_MEKE.
 
-  if (CS%eke_src == EKE_SILC) call CS%silc%destructor()
   if (associated(CS)) deallocate(CS)
 
   if (.not.associated(MEKE)) return
