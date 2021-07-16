@@ -5,7 +5,9 @@ use MOM_cpu_clock,        only : cpu_clock_id, cpu_clock_begin, cpu_clock_end, C
 use MOM_error_handler,    only : MOM_error, FATAL, WARNING, NOTE, MOM_mesg, is_root_pe
 use MOM_file_parser,      only : read_param, get_param, log_version, param_file_type
 use smartredis_client,    only : client_type
-
+#ifdef NUOPC_INTERFACE
+use nuopc_shr_methods,    only : sr_client
+#endif
 implicit none; private
 
 public :: client_type
@@ -15,12 +17,14 @@ contains
 subroutine smartredis_init(param_file, client)
   type(param_file_type), intent(in   ) :: param_file !< Parameter file structure
   type(client_type),     intent(inout) :: client     !< Client used to communicate with the SmartRedis database
-
   character(len=40) :: mdl = "MOM_SMARTREDIS"
   logical :: use_smartredis
   logical :: use_smartredis_cluster
   integer :: id_client_init
-
+#ifdef NUOPC_INTERFACE
+  ! CESM has already initialized the client in sr_client
+  client = sr_client
+#else
   call get_param(param_file, mdl, "USE_SMARTREDIS",  use_smartredis, &
   		 "If true, initialize the client used to communcicate "//&
 		 "with the SmartRedis database", default=.false.)
@@ -34,7 +38,7 @@ subroutine smartredis_init(param_file, client)
     call client%initialize(use_smartredis_cluster)
     call cpu_clock_end(id_client_init)
   endif
-
+#endif
 end subroutine smartredis_init
 
 end module MOM_smartredis
