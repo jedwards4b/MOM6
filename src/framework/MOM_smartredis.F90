@@ -24,7 +24,6 @@ subroutine smartredis_init(param_file, client, client_in)
   logical :: use_smartredis
   logical :: use_smartredis_cluster
   integer :: id_client_init
-
   call get_param(param_file, mdl, "USE_SMARTREDIS",  use_smartredis, &
                  "If true, use the data client to connect"//&
                  "with the SmartRedis database", default=.false.)
@@ -50,7 +49,6 @@ subroutine smartredis_init(param_file, client, client_in)
     call cpu_clock_end(id_client_init)
 
   endif
-
 end subroutine smartredis_init
 
 end module MOM_smartredis
