@@ -9,6 +9,8 @@ implicit none; private
 type, public :: client_type
   private
 
+  logical :: is_initialized = .false. !< True if client is initialized
+
   contains
 
   ! Public procedures
@@ -21,6 +23,8 @@ type, public :: client_type
 
   !> Initializes a new instance of the SmartRedis client
   procedure :: initialize
+  !> Check if a SmartRedis client has been initialized
+  procedure :: isinitialized
   !> Destructs a new instance of the SmartRedis client
   procedure :: destructor
   !> Check the database for the existence of a specific model
@@ -101,6 +105,11 @@ subroutine initialize( this, cluster )
   logical, optional :: cluster !< If true, client uses a database cluster (Default: .false.)
 
 end subroutine initialize
+
+logical function isinitialized(this)
+  class(client_type) :: this
+  isinitialized = this%is_initialized
+end function isinitialized
 
 !> A destructor for the SmartRedis client
 subroutine destructor( this )

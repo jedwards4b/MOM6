@@ -133,8 +133,8 @@ use MOM_wave_interface,        only : Update_Stokes_Drift
 use MOM_oda_driver_mod,        only : ODA_CS, oda, init_oda, oda_end
 use MOM_oda_driver_mod,        only : set_prior_tracer, set_analysis_time, apply_oda_tracer_increments
 
-! Machine-learning models
-use MOM_smartredis,            only : client_type
+! Machine-learning model interface
+use MOM_smartredis,            only : client_type, smartredis_init
 
 ! Offline modules
 use MOM_offline_main,          only : offline_transport_CS, offline_transport_init, update_offline_fields
@@ -1631,7 +1631,7 @@ end subroutine step_offline
 !! initializing the ocean state variables, and initializing subsidiary modules
 subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
                           Time_in, offline_tracer_mode, input_restart_file, diag_ptr, &
-                          count_calls, tracer_flow_CSp,  ice_shelf_CSp)
+                          count_calls, tracer_flow_CSp,  ice_shelf_CSp, client_in)
   type(time_type), target,   intent(inout) :: Time        !< model time, set in this routine
   type(time_type),           intent(in)    :: Time_init   !< The start time for the coupled model's calendar
   type(param_file_type),     intent(out)   :: param_file  !< structure indicating parameter file to parse
@@ -1652,7 +1652,10 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   logical,         optional, intent(in)    :: count_calls !< If true, nstep_tot counts the number of
                                                           !! calls to step_MOM instead of the number of
                                                           !! dynamics timesteps.
-  type(ice_shelf_CS), optional,     pointer :: ice_shelf_CSp !< A pointer to an ice shelf control structure
+  type(ice_shelf_CS), optional, pointer            :: ice_shelf_CSp !< A pointer to an ice shelf control structure
+  type(client_type),  optional,         intent(in) :: client_in !< The data client used to communicate with the
+                                                         !! RedisAI database. If present, this client must have been
+                                                         !! initialized prior to the call to initialize_MOM.
   ! local variables
   type(ocean_grid_type),  pointer :: G => NULL()    ! A pointer to the metric grid use for the run
   type(ocean_grid_type),  pointer :: G_in => NULL() ! Pointer to the input grid
@@ -2619,6 +2622,8 @@ subroutine initialize_MOM(Time, Time_init, param_file, dirs, CS, restart_CSp, &
   endif
   call cpu_clock_end(id_clock_MOM_init)
   call callTree_waypoint("ALE initialized (initialize_MOM)")
+
+  call smartredis_init( param_file, CS%client, client_in)
 
   call MEKE_init(Time, G, US, param_file, diag, CS%client, CS%MEKE_CSp, CS%MEKE, restart_CSp, CS%useMEKE, CS%MEKE_in_dynamics)
 

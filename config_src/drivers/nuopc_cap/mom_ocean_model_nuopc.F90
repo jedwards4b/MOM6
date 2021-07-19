@@ -61,7 +61,7 @@ use MOM_surface_forcing_nuopc, only : surface_forcing_init, convert_IOB_to_fluxe
 use MOM_surface_forcing_nuopc, only : convert_IOB_to_forces, ice_ocn_bnd_type_chksum
 use MOM_surface_forcing_nuopc, only : ice_ocean_boundary_type, surface_forcing_CS
 use MOM_surface_forcing_nuopc, only : forcing_save_restart
-
+use nuopc_shr_methods,         only : sr_client
 #include <MOM_memory.h>
 
 #ifdef _USE_GENERIC_TRACER
@@ -276,7 +276,7 @@ subroutine ocean_model_init(Ocean_sfc, OS, Time_init, Time_in, gas_fields_ocn, i
   call initialize_MOM(OS%Time, Time_init, param_file, OS%dirs, OS%MOM_CSp, &
                       OS%restart_CSp, Time_in, offline_tracer_mode=OS%offline_tracer_mode, &
                       input_restart_file=input_restart_file, &
-                      diag_ptr=OS%diag, count_calls=.true.)
+                      diag_ptr=OS%diag, count_calls=.true., client_in=sr_client)
   call get_MOM_state_elements(OS%MOM_CSp, G=OS%grid, GV=OS%GV, US=OS%US, C_p=OS%C_p, &
                               C_p_scaled=OS%fluxes%C_p, use_temp=use_temperature)
 
