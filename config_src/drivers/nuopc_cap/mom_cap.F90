@@ -1890,7 +1890,7 @@ subroutine ModelAdvance(gcomp, rc)
 
         rpointer_filename = 'rpointer.ocn'//trim(inst_suffix)//timestamp
 
-        write(restartname,'(A,".mom6.r.",A)') &
+        write(restartname,'(A,".mom6.r",A)') &
              trim(casename), timestamp
         call ESMF_LogWrite("MOM_cap: Writing restart :  "//trim(restartname), ESMF_LOGMSG_INFO)
         ! write restart file(s)
