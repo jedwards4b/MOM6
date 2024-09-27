@@ -136,6 +136,7 @@ logical              :: profile_memory = .true.
 logical              :: grid_attach_area = .false.
 logical              :: use_coldstart = .true.
 logical              :: use_mommesh = .true.
+logical              :: restart_eor = .false.
 character(len=128)   :: scalar_field_name = ''
 integer              :: scalar_field_count = 0
 integer              :: scalar_field_idx_grid_nx = 0
@@ -381,6 +382,13 @@ subroutine InitializeP0(gcomp, importState, exportState, clock, rc)
     geomtype = ESMF_GEOMTYPE_GRID
   endif
 
+  ! Read end of run restart config option
+  call NUOPC_CompAttributeGet(gcomp, name="write_restart_at_endofrun", value=value, &
+                              isPresent=isPresent, isSet=isSet, rc=rc)
+  if (ChkErr(rc,__LINE__,u_FILE_u)) return
+  if (isPresent .and. isSet) then
+     if (trim(value) .eq. '.true.') restart_eor = .true.
+  end if
 
 end subroutine
 
@@ -738,6 +746,10 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
              Ice_ocean_boundary% hrofi (isc:iec,jsc:jec),           &
              Ice_ocean_boundary% hevap (isc:iec,jsc:jec),           &
              Ice_ocean_boundary% hcond (isc:iec,jsc:jec),           &
+             Ice_ocean_boundary% lrunoff_glc (isc:iec,jsc:jec),     &
+             Ice_ocean_boundary% frunoff_glc (isc:iec,jsc:jec),     &
+             Ice_ocean_boundary% hrofl_glc (isc:iec,jsc:jec),       &
+             Ice_ocean_boundary% hrofi_glc (isc:iec,jsc:jec),       &
              source=0.0)
 
     ! Needed for MARBL
@@ -798,6 +810,10 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Sa_pslv"        , "will provide")
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofl"      , "will provide") !-> liquid runoff
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_rofi"      , "will provide") !-> ice runoff
+  if (cesm_coupled) then
+    call fld_list_add(fldsToOcn_num, fldsToOcn, "Forr_rofl_glc"  , "will provide") !-> liquid glc runoff
+    call fld_list_add(fldsToOcn_num, fldsToOcn, "Forr_rofi_glc"  , "will provide") !-> frozen glc runoff
+  endif
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Si_ifrac"       , "will provide") !-> ice fraction
   call fld_list_add(fldsToOcn_num, fldsToOcn, "So_duu10n"      , "will provide") !-> wind^2 at 10m
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Fioi_meltw"     , "will provide")
@@ -809,6 +825,10 @@ subroutine InitializeAdvertise(gcomp, importState, exportState, clock, rc)
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hcond"     , "will provide")
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofl"     , "will provide")
   call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofi"     , "will provide")
+  if (cesm_coupled) then
+    call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofl_glc" , "will provide")
+    call fld_list_add(fldsToOcn_num, fldsToOcn, "Foxx_hrofi_glc" , "will provide")
+  endif
 
   if (Ice_ocean_boundary%ice_ncat > 0) then
     call fld_list_add(fldsToOcn_num, fldsToOcn, "Sf_afracr", "will provide")
@@ -1701,6 +1721,8 @@ subroutine ModelAdvance(gcomp, rc)
   real(8)                                :: MPI_Wtime, timers
   logical                                :: write_restart
   logical                                :: write_restartfh
+  logical                                :: write_restart_eor
+
 
   rc = ESMF_SUCCESS
   if(profile_memory) call ESMF_VMLogMemInfo("Entering MOM Model_ADVANCE: ")
@@ -1840,7 +1862,6 @@ subroutine ModelAdvance(gcomp, rc)
   !---------------
   ! Get the stop alarm
   !---------------
-
   call ESMF_ClockGetAlarm(clock, alarmname='stop_alarm', alarm=stop_alarm, rc=rc)
   if (ChkErr(rc,__LINE__,u_FILE_u)) return
 
@@ -1871,7 +1892,18 @@ subroutine ModelAdvance(gcomp, rc)
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
     end if
 
-    if (write_restart .or. write_restartfh) then
+    write_restart_eor = .false.
+    if (restart_eor) then
+      if (ESMF_AlarmIsRinging(stop_alarm, rc=rc)) then
+         if (ChkErr(rc,__LINE__,u_FILE_u)) return
+         write_restart_eor = .true.
+         ! turn off the alarm
+         call ESMF_AlarmRingerOff(stop_alarm, rc=rc )
+         if (ChkErr(rc,__LINE__,u_FILE_u)) return
+       end if
+    end if
+
+    if (write_restart .or. write_restartfh .or. write_restart_eor) then
       ! determine restart filename
       call ESMF_ClockGetNextTime(clock, MyTime, rc=rc)
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -2842,6 +2874,34 @@ end subroutine shr_log_setLogUnit
 !!     <td>kg m-2 s-1</td>
 !!     <td>runoff</td>
 !!     <td>mass flux of frozen runoff</td>
+!!     <td></td>
+!! </tr>
+!! <tr>
+!!     <td>Forr_rofl_glc</td>
+!!     <td>kg m-2 s-1</td>
+!!     <td>runoff</td>
+!!     <td>mass flux of liquid glc runoff</td>
+!!     <td></td>
+!! </tr>
+!! <tr>
+!!     <td>Forr_rofi_glc</td>
+!!     <td>kg m-2 s-1</td>
+!!     <td>runoff</td>
+!!     <td>mass flux of frozen glc runoff</td>
+!!     <td></td>
+!! </tr>
+!! <tr>
+!!     <td>Foxx_hrofi_glc</td>
+!!     <td>W m-2</td>
+!!     <td>hrofi_glc</td>
+!!     <td>heat content (enthalpy) of frozen glc runoff</td>
+!!     <td></td>
+!! </tr>
+!! <tr>
+!!     <td>Foxx_hrofl_glc</td>
+!!     <td>W m-2</td>
+!!     <td>hrofl_glc</td>
+!!     <td>heat content (enthalpy) of liquid glc runoff</td>
 !!     <td></td>
 !! </tr>
 !! <tr>
