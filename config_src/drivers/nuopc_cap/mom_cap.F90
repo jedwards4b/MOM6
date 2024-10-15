@@ -1910,8 +1910,6 @@ subroutine ModelAdvance(gcomp, rc)
       call ESMF_TimeGet (MyTime, yy=year, mm=month, dd=day, h=hour, m=minute, s=seconds, rc=rc )
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
       
-      if (is_root_pe()) print *,__FILE__,__LINE__,write_restart,write_restartfh,write_restart_eor,restart_eor, month, day, hour, minute, seconds
-
       if (cesm_coupled) then
         call NUOPC_CompAttributeGet(gcomp, name='case_name', value=casename, rc=rc)
         if (ChkErr(rc,__LINE__,u_FILE_u)) return
