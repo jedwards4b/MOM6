@@ -1909,7 +1909,6 @@ subroutine ModelAdvance(gcomp, rc)
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
       call ESMF_TimeGet (MyTime, yy=year, mm=month, dd=day, h=hour, m=minute, s=seconds, rc=rc )
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
-      
       if (cesm_coupled) then
         call NUOPC_CompAttributeGet(gcomp, name='case_name', value=casename, rc=rc)
         if (ChkErr(rc,__LINE__,u_FILE_u)) return
@@ -2083,6 +2082,39 @@ subroutine ModelSetRunClock(gcomp, rc)
 
   if (first_time) then
     !--------------------------------
+    ! set stop alarm
+    !--------------------------------
+
+    ! create a 1-shot alarm at the driver stop time
+    call NUOPC_CompAttributeGet(gcomp, name="stop_option", value=stop_option, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    
+    call NUOPC_CompAttributeGet(gcomp, name="stop_n", value=cvalue, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    read(cvalue,*) stop_n
+    
+    call NUOPC_CompAttributeGet(gcomp, name="stop_ymd", value=cvalue, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    read(cvalue,*) stop_ymd
+    
+    call alarmInit(mclock, stop_alarm, stop_option, &
+         opt_n   = stop_n,           &
+         opt_ymd = stop_ymd,         &
+         RefTime = mcurrTime,           &
+         alarmname = 'stop_alarm', rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    call ESMF_AlarmSet(stop_alarm, clock=mclock, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    call ESMF_LogWrite(subname//" Create Stop alarm", ESMF_LOGMSG_INFO)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+
+    call ESMF_AlarmGet(stop_alarm, ringtime=dstoptime, rc=rc)
+    call ESMF_TimeGet(dstoptime, timestring=timestr, rc=rc)
+    call ESMF_LogWrite("Stop Alarm will ring at : "//trim(timestr), ESMF_LOGMSG_INFO)
+
+    !--------------------------------
     ! set restart alarm
     !--------------------------------
 
@@ -2169,35 +2201,6 @@ subroutine ModelSetRunClock(gcomp, rc)
       if (ChkErr(rc,__LINE__,u_FILE_u)) return
       call ESMF_LogWrite(subname//" Restart alarm is Created and Set", ESMF_LOGMSG_INFO)
     endif
-
-    ! create a 1-shot alarm at the driver stop time
-    call NUOPC_CompAttributeGet(gcomp, name="stop_option", value=stop_option, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    
-    call NUOPC_CompAttributeGet(gcomp, name="stop_n", value=cvalue, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    read(cvalue,*) stop_n
-    
-    call NUOPC_CompAttributeGet(gcomp, name="stop_ymd", value=cvalue, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-    read(cvalue,*) stop_ymd
-    
-    call alarmInit(mclock, stop_alarm, stop_option, &
-         opt_n   = stop_n,           &
-         opt_ymd = stop_ymd,         &
-         RefTime = mcurrTime,           &
-         alarmname = 'stop_alarm', rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    call ESMF_AlarmSet(stop_alarm, clock=mclock, rc=rc)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    call ESMF_LogWrite(subname//" Create Stop alarm", ESMF_LOGMSG_INFO)
-    if (ChkErr(rc,__LINE__,u_FILE_u)) return
-
-    call ESMF_AlarmGet(stop_alarm, ringtime=dstoptime, rc=rc)
-    call ESMF_TimeGet(dstoptime, timestring=timestr, rc=rc)
-    call ESMF_LogWrite("Stop Alarm will ring at : "//trim(timestr), ESMF_LOGMSG_INFO)
 
     ! set up Times to write non-interval restarts
     call NUOPC_CompAttributeGet(gcomp, name='restart_fh', isPresent=isPresent, isSet=isSet, rc=rc)

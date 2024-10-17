@@ -13,7 +13,7 @@ use ESMF                  , only : ESMF_TimeInterval, ESMF_TimeIntervalSet
 use ESMF                  , only : ESMF_ClockGet, ESMF_AlarmCreate
 use ESMF                  , only : ESMF_SUCCESS, ESMF_LogWrite, ESMF_LOGMSG_INFO
 use ESMF                  , only : ESMF_LogSetError, ESMF_LogFoundError, ESMF_LOGERR_PASSTHRU
-use ESMF                  , only : ESMF_RC_ARG_BAD
+use ESMF                  , only : ESMF_RC_ARG_BAD, ESMF_AlarmGet, ESMF_ClockGetAlarm
 use ESMF                  , only : operator(<), operator(/=), operator(+), operator(-), operator(*) , operator(>=)
 use ESMF                  , only : operator(<=), operator(>), operator(==)
 use MOM_cap_methods       , only : ChkErr
@@ -45,6 +45,7 @@ character(len=*), private, parameter :: &
     optNYear          = "nyear"     , &
     optMonthly        = "monthly"   , &
     optYearly         = "yearly"    , &
+    optEnd            = "end"       , &
     optDate           = "date"      , &
     optIfdays0        = "ifdays0"   , &
     optGLCCouplingPeriod = "glc_coupling_period"
@@ -154,6 +155,17 @@ subroutine AlarmInit( clock, alarm, option, &
     call ESMF_TimeSet( NextAlarm, yy=9999, mm=12, dd=1, s=0, calendar=cal, rc=rc )
     if (ChkErr(rc,__LINE__,u_FILE_u)) return
     update_nextalarm  = .false.
+
+  case (optEnd)
+    call ESMF_TimeIntervalSet(AlarmInterval, yy=9999, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    call ESMF_ClockGetAlarm(clock, alarmname="stop_alarm", alarm=alarm, rc=rc)
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+    call ESMF_AlarmGet(alarm, ringTime=NextAlarm, rc=rc) 
+    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+!    call ESMF_TimeSet( NextAlarm, yy=9999, mm=12, dd=1, s=0, calendar=cal, rc=rc )
+!    if (ChkErr(rc,__LINE__,u_FILE_u)) return
+!    update_nextalarm  = .true.
 
   case (optDate)
     if (.not. present(opt_ymd)) then
